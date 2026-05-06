@@ -1,0 +1,31 @@
+[Unit]
+Description=PolyVane Polymarket Trading Bot
+After=network-online.target
+Wants=network-online.target
+# Crash-loop containment: if the unit restarts more than 5 times in 5 minutes,
+# stop trying. (StartLimit* belong in [Unit] in modern systemd.)
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=polyvane
+Group=polyvane
+WorkingDirectory=/opt/polyvane
+EnvironmentFile=/opt/polyvane/.env
+ExecStart=/opt/polyvane/venv/bin/python -m main
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/polyvane/data /opt/polyvane/logs
+PrivateTmp=true
+# Stdout goes to journal (visible via `journalctl -u polyvane -f`); stderr
+# (uncaught Python crashes before logging is up) goes to a separate file
+# so it doesn't interleave with the structured Python log.
+StandardOutput=journal
+StandardError=append:/opt/polyvane/logs/polyvane-error.log
+
+[Install]
+WantedBy=multi-user.target

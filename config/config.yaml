@@ -1,0 +1,291 @@
+# Polymarket trading bot configuration.
+# All tunable parameters live here. Conservative defaults — review before going live.
+
+risk:
+  # Fractional Kelly multiplier (0.25 = quarter Kelly). Lower = safer.
+  kelly_fraction: 0.25
+  # Hard global ceiling on any single position in USD. Volume tiers below
+  # narrow this further per-market; whichever is tighter wins.
+  max_position_usd: 15.0
+  # Maximum NEW positions opened per UTC day across ALL strategies. This is
+  # a global ceiling — for paper testing the per-strategy cap below is what
+  # actually shapes behavior; this just keeps a runaway bot from filling the
+  # journal. Tighten for live (was 15 globally before paper-mode loosening).
+  max_daily_positions: 1000
+  # Maximum simultaneously open positions GLOBALLY. Acts as a bug-containment
+  # ceiling — see max_concurrent_positions_per_strategy below for the cap
+  # that actually matters in paper mode. Tighten to ~30-50 for live.
+  max_concurrent_positions: 1000
+  # Per-strategy concurrent-position cap. Each strategy gets its own slot
+  # pool, so strategies don't starve each other when they fire signals
+  # near-simultaneously. Loose for paper; tighten to ~10-20 for live.
+  max_concurrent_positions_per_strategy: 200
+  # Daily realized-loss circuit breaker. Hitting this halts ALL trading.
+  max_daily_loss_usd: 50.0
+  # Maximum exposure to any single market category as a fraction of total deployed capital.
+  # NOTE: in paper-mode multi-strategy testing, all variants trade weather markets,
+  # so a 30% cap blocks every trade ("category would be 100% of book"). Setting to
+  # 1.0 disables the cap. Tighten back down for live trading once you have signal on
+  # which strategies actually work.
+  max_category_exposure_pct: 1.0
+  # Minimum edge required to consider a signal tradeable (10% = 0.10).
+  min_edge_pct: 0.10
+  # Volume-aware position caps. The first tier whose [min, max) range
+  # contains the market's volumeUsd determines the per-trade ceiling.
+  # Calibrated to April 2026 Polymarket conditions: deeper books at the top
+  # end, but more bot competition — so caps grow modestly, not aggressively.
+  volume_position_tiers:
+    - name: low
+      min_volume_usd: 0
+      max_volume_usd: 50000
+      max_position_usd: 3.0
+    - name: mid
+      min_volume_usd: 50000
+      max_volume_usd: 200000
+      max_position_usd: 8.0
+    - name: high
+      min_volume_usd: 200000
+      max_volume_usd: inf
+      max_position_usd: 15.0
+
+execution:
+  # paper = log only, never submit. live = real orders. Default to paper.
+  mode: paper
+  # limit | market. Polymarket CLOB uses limit-style GTC orders by default.
+  order_type: limit
+  # If true, splits each entry into multiple tranches to reduce slippage/fill risk.
+  staged_entry: true
+  staged_tranches: 2
+  # Fraction of mid-spread to offer when posting limit orders (0.0 = at mid, 0.01 = 1% inside).
+  limit_offset_pct: 0.005
+  # Per-order retry configuration on transient failures.
+  max_order_retries: 3
+  retry_backoff_sec: 2.0
+
+polling:
+  # How often each strategy's scan() is invoked.
+  market_scan_interval_sec: 120
+  # How often open positions are checked for exit conditions / PnL updates.
+  position_check_interval_sec: 60
+  # How often the risk module re-evaluates global limits (daily reset, drawdown).
+  risk_check_interval_sec: 30
+
+logger:
+  # SQLite path. Relative to project root.
+  db_path: data/trade_journal.db
+  # Console log level: DEBUG | INFO | WARNING | ERROR
+  level: INFO
+
+api:
+  # Base URL for the Polymarket CLOB. The production endpoint is unchanged
+  # post-V2 migration (2026-04-28); only the backend changed.
+  clob_host: https://clob.polymarket.com
+  # CLOB exchange version. V2 went live on 2026-04-28. Settles in pUSD.
+  exchange_version: "v2"
+  # Polygon chain id.
+  chain_id: 137
+  # Per-request timeout (seconds).
+  request_timeout_sec: 15
+  # Exponential backoff parameters for retries.
+  retry_max_attempts: 5
+  retry_initial_delay_sec: 1.0
+  retry_max_delay_sec: 30.0
+
+monitoring:
+  dashboard_refresh_sec: 30
+  alerts:
+    discord_webhook_url: ""    # optional
+    discord_user_id: ""        # optional — numeric Discord ID (snowflake) to @ping in daily summary
+    telegram_bot_token: ""     # optional
+    telegram_chat_id: ""       # optional
+    daily_summary_time: "13:00"
+    trade_notifications: true
+    new_city_notifications: true
+    alert_cooldown_sec: 300
+  review:
+    auto_resolve_check_interval_sec: 600
+    weekly_review_day: sunday
+    bias_flag_threshold_pct: 0.02
+    mismatch_std_dev_multiple: 2.0
+  health:
+    # Minimum pUSD wallet balance before trading is paused (live mode).
+    min_wallet_balance_usd: 20.0
+    max_scan_gap_sec: 900
+    error_alert_threshold: 5
+    error_window_sec: 3600
+    poll_interval_sec: 60
+    # Heartbeat write cadence (seconds). The healthcheck.sh cron checks the
+    # heartbeat file's mtime to detect a wedged bot.
+    heartbeat_interval_sec: 60
+
+# Default paper bankroll per strategy when a strategy isn't listed under
+# `paper_bankroll_per_strategy` below. Bumped from $100 to $1000 so paper
+# trades aren't artificially suppressed by Kelly sizing on a tiny pool —
+# we want clean signal on which strategies actually work.
+paper_bankroll_usd: 1000.0
+
+# Per-strategy paper bankrolls. Each strategy gets its own isolated pool so
+# variants can be compared apples-to-apples. In live mode this map is
+# informational only — all strategies share the on-chain pUSD balance.
+paper_bankroll_per_strategy:
+  weather:                1000.0
+  weather_conservative:   1000.0
+  weather_aggressive:     1000.0
+  lazy_50:                1000.0
+  lazy_60:                1000.0
+  lazy_70:                1000.0
+
+# Reusable city list. YAML anchors keep the three weather variants in sync
+# without duplicating the list.
+_weather_cities: &weather_cities
+  [NYC, Dallas, Atlanta, London, Hong Kong, Toronto, Ankara, Wellington, Seoul, Shanghai]
+
+# Strategy registry. Each entry: name (must match a module under strategies/),
+# enabled flag, and a free-form `params` block passed to the strategy at init.
+strategies:
+  # ---- Weather: baseline -----------------------------------------------
+  - name: weather
+    enabled: true
+    params:
+      cities: *weather_cities
+      require_confirmed_resolution: true
+      forecast_models: [noaa, open_meteo_gfs, open_meteo_ecmwf, open_meteo_icon]
+      forecast_model_weights:
+        noaa: 1.0
+        open_meteo_ecmwf: 1.0
+        open_meteo_icon: 1.0
+        open_meteo_gfs: 1.0
+      per_source_std_dev_f: {}
+      min_agreement: 0.7
+      agreement_scale_f: 3.0
+      min_edge_pct: 0.15
+      adjacent_min_edge_pct: 0.10
+      trade_adjacent_buckets: true
+      min_hours_to_resolution: 12
+      max_forecast_horizon_hours: 48
+      scan_interval_sec: 300
+      scan_on_model_update: true
+      min_liquidity_usd: 100.0
+      noaa_max_rps: 5.0
+
+  # ---- Weather: conservative (tighter edges, primary buckets only) -----
+  - name: weather_conservative
+    enabled: true
+    params:
+      cities: *weather_cities
+      require_confirmed_resolution: true
+      forecast_models: [noaa, open_meteo_gfs, open_meteo_ecmwf, open_meteo_icon]
+      forecast_model_weights:
+        noaa: 1.0
+        open_meteo_ecmwf: 1.0
+        open_meteo_icon: 1.0
+        open_meteo_gfs: 1.0
+      per_source_std_dev_f: {}
+      # Stricter agreement gate — only trade when models are tight.
+      min_agreement: 0.80
+      agreement_scale_f: 3.0
+      # Higher edge floor for primary; no adjacent-bucket trades at all.
+      min_edge_pct: 0.20
+      adjacent_min_edge_pct: 0.15
+      trade_adjacent_buckets: false
+      min_hours_to_resolution: 12
+      max_forecast_horizon_hours: 48
+      scan_interval_sec: 300
+      scan_on_model_update: true
+      min_liquidity_usd: 200.0    # require deeper books too
+      noaa_max_rps: 5.0
+
+  # ---- Weather: aggressive (looser edges, more opportunities) ----------
+  - name: weather_aggressive
+    enabled: true
+    params:
+      cities: *weather_cities
+      require_confirmed_resolution: true
+      forecast_models: [noaa, open_meteo_gfs, open_meteo_ecmwf, open_meteo_icon]
+      forecast_model_weights:
+        noaa: 1.0
+        open_meteo_ecmwf: 1.0
+        open_meteo_icon: 1.0
+        open_meteo_gfs: 1.0
+      per_source_std_dev_f: {}
+      # Tolerate more model disagreement.
+      min_agreement: 0.55
+      agreement_scale_f: 3.0
+      # Looser edge floors. Adjacent buckets allowed at very low edge.
+      min_edge_pct: 0.10
+      adjacent_min_edge_pct: 0.07
+      trade_adjacent_buckets: true
+      min_hours_to_resolution: 12
+      max_forecast_horizon_hours: 48
+      scan_interval_sec: 300
+      scan_on_model_update: true
+      min_liquidity_usd: 50.0
+      noaa_max_rps: 5.0
+
+  # ---- Lazy variants ---------------------------------------------------
+  # Each buys any temperature bucket whose YES price has reached its
+  # threshold and resolves within 12-48h, then holds. The `claimed_edge_pct`
+  # is the hypothesis we're testing — it's what the risk module uses for
+  # Kelly sizing. After resolution we'll see if the claim was justified.
+
+  - name: lazy_50
+    enabled: true
+    params:
+      price_threshold: 0.50       # 2x payoff if YES — the natural sweet spot
+      claimed_edge_pct: 0.10
+      max_price: 0.95
+      min_hours_to_resolution: 12
+      max_forecast_horizon_hours: 48
+      scan_interval_sec: 300
+      min_liquidity_usd: 100.0
+
+  - name: lazy_60
+    enabled: true
+    params:
+      price_threshold: 0.60       # ~1.67x payoff, stronger consensus
+      claimed_edge_pct: 0.10
+      max_price: 0.95
+      min_hours_to_resolution: 12
+      max_forecast_horizon_hours: 48
+      scan_interval_sec: 300
+      min_liquidity_usd: 100.0
+
+  - name: lazy_70
+    enabled: true
+    params:
+      price_threshold: 0.70       # ~1.43x payoff, very strong consensus
+      claimed_edge_pct: 0.10
+      max_price: 0.95
+      min_hours_to_resolution: 12
+      max_forecast_horizon_hours: 48
+      scan_interval_sec: 300
+      min_liquidity_usd: 100.0
+
+  # ---- Other strategies (still scaffolds — disabled) -------------------
+  - name: arbitrage
+    enabled: false
+    params:
+      min_spread_pct: 0.04
+      min_book_depth_usd: 50
+      max_position_usd: 10
+      scan_interval_sec: 30
+      fee_buffer_pct: 0.01
+      share_market_data: true
+      categories: []
+  - name: whale
+    enabled: false
+    params:
+      tracked_wallets: []
+      min_wallet_score: 0.7
+      min_trade_size_usd: 5000
+      consensus_threshold: 0.8
+      scan_interval_sec: 60
+      rpc_provider_url: ""
+      exclude_arb_bots: true
+      categories: []
+
+# Shared market-data cache used by strategies to avoid redundant API calls.
+# Each strategy that reads market metadata writes into the cache; later
+# scans by other strategies read fresh entries instead of refetching.
+market_cache:
+  default_ttl_sec: 30

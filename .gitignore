@@ -1,0 +1,76 @@
+# --- OS & editors ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.envrc
+
+# Tooling / tests
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+dmypy.json
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+.tox/
+.nox/
+
+# --- Secrets & local env (keep *example* files tracked) ---
+.env
+.env.*
+!.env.example
+!deploy/.env.production.example
+!**/.env*.example
+
+# --- polyvane runtime & local artifacts ---
+.live-trading-enabled
+.backtest-cache/
+
+# Trade journal & DB copies (see Makefile remote-dashboard / remote-perf)
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# App logs (RotatingFileHandler backups live under logs/)
+logs/
+*.log
+
+.calibrate-cache/
+
+# Optional: local overrides next to committed config (uncomment if you use this pattern)
+# config/config.local.yaml
