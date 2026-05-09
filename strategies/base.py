@@ -94,10 +94,14 @@ class StrategyContext:
 
     Strategies should NOT call the executor directly — the main loop owns
     routing. They MAY use the client for read-only market data lookups,
-    and use `market_cache` to share/discover snapshots populated by other
-    strategies (so e.g. the arb scanner can layer on top of weather data
-    without re-fetching from Gamma).
+    use `market_cache` to share/discover snapshots populated by other
+    strategies, and read the `journal` to rebuild in-memory state at
+    setup() (e.g. lazy hydrates its ladder-fired set from open positions
+    so a bot restart doesn't re-fire rungs that already have open trades).
+    Strategies must NEVER write to the journal directly; the executor owns
+    that path.
     """
     client: Any              # core.client.ClobClient
     config: dict[str, Any]   # full parsed config (read-only)
     market_cache: Any = None  # core.market_cache.MarketCache | None
+    journal: Any = None       # core.logger.TradeJournal | None — read-only use

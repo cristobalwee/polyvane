@@ -47,6 +47,13 @@ risk:
       min_volume_usd: 200000
       max_volume_usd: inf
       max_position_usd: 15.0
+  # Reject a new trade when the strategy already holds an open position on
+  # the same market_id. Default true. Strategies in the override map below
+  # use their own value — `lazy` opts out so its price-ladder rungs aren't
+  # rejected as duplicates.
+  dedup_open_positions: true
+  dedup_open_positions_per_strategy:
+    lazy: false
 
 execution:
   # paper = log only, never submit. live = real orders. Default to paper.
@@ -128,12 +135,8 @@ paper_bankroll_usd: 1000.0
 # variants can be compared apples-to-apples. In live mode this map is
 # informational only — all strategies share the on-chain pUSD balance.
 paper_bankroll_per_strategy:
-  weather:                1000.0
-  weather_conservative:   1000.0
-  weather_aggressive:     1000.0
-  lazy_50:                1000.0
-  lazy_60:                1000.0
-  lazy_70:                1000.0
+  weather: 1000.0
+  lazy:    1000.0
 
 # Reusable city list. YAML anchors keep the three weather variants in sync
 # without duplicating the list.
@@ -157,24 +160,58 @@ _weather_cities: &weather_cities
 # Strategy registry. Each entry: name (must match a module under strategies/),
 # enabled flag, and a free-form `params` block passed to the strategy at init.
 strategies:
-  # ---- Weather: baseline -----------------------------------------------
+  # ---- Weather (consolidated) ------------------------------------------
+  # Single weather strategy, replacing the previous baseline / aggressive /
+  # conservative split. The split was masking a model bug: the conservative
+  # variant's tight `min_agreement` gate combined with uncalibrated forecast
+  # std devs pushed it to its WORST trades (highest claimed edge, -65% ROI
+  # lifetime). The agreement gate is disabled until bias correction lands.
+  #
+  # `per_source_std_dev_f` and `forecast_model_weights` are populated from
+  # the 30-day calibrate.py run on 2026-05-09. ECMWF is dropped: the
+  # historical-archive endpoint returned no samples during calibration —
+  # re-add once the data path is verified.
   - name: weather
     enabled: true
     params:
       cities: *weather_cities
       require_confirmed_resolution: true
-      forecast_models: [noaa, open_meteo_gfs, open_meteo_ecmwf, open_meteo_icon]
+      forecast_models: [noaa, open_meteo_gfs, open_meteo_icon]
       forecast_model_weights:
-        noaa: 1.0
-        open_meteo_ecmwf: 1.0
-        open_meteo_icon: 1.0
-        open_meteo_gfs: 1.0
-      per_source_std_dev_f: {}
-      min_agreement: 0.7
+        open_meteo_gfs: 0.366
+        noaa: 0.326
+        open_meteo_icon: 0.308
+      per_source_std_dev_f:
+        noaa: 2.22
+        open_meteo_gfs: 2.10
+        open_meteo_icon: 2.28
+      # Per-city forecast bias correction (°F). Subtracted from each
+      # member's mean before ensembling. Positive = forecasts run warm.
+      # Sourced from `python -m strategies.weather.calibrate` on 2026-05-09
+      # (30-day window, 1669 events). Refresh whenever the model set or
+      # weights change. Cities not listed pass through uncorrected.
+      per_city_bias_f:
+        Chicago:        2.10
+        Dallas:         2.02
+        Denver:        -1.01
+        Austin:         0.99
+        NYC:           -0.88
+        Hong Kong:      0.85
+        Miami:          0.69
+        San Francisco: -0.68
+      # Floor on |bias| to actually apply. Below this, treat as noise.
+      min_bias_apply_f: 0.5
+      # Disabled. Empirical: requiring high agreement was selecting trades
+      # where independent models shared a correlated bias — exactly the
+      # losing tail. Re-enable only after we can show the gate adds value.
+      min_agreement: 0.0
       agreement_scale_f: 3.0
       min_edge_pct: 0.15
       adjacent_min_edge_pct: 0.10
       trade_adjacent_buckets: true
+      # Reject signals claiming edge above this — almost always a model bug
+      # (sign error, probability inflation, uncorrected per-city bias).
+      max_edge_sanity: 0.30
       min_hours_to_resolution: 12
       max_forecast_horizon_hours: 48
       scan_interval_sec: 300
@@ -182,92 +219,16 @@ strategies:
       min_liquidity_usd: 100.0
       noaa_max_rps: 5.0
 
-  # ---- Weather: conservative (tighter edges, primary buckets only) -----
-  - name: weather_conservative
+  # ---- Lazy (consolidated, with price-conviction ladder) ---------------
+  # Replaces lazy_50 / lazy_60 / lazy_70. Entry floor $0.60 (proven by
+  # 30-day journal: 1W/5L below $0.55, 50% WR at $0.55–0.60, 100% WR at
+  # $0.60+). Each higher rung is a pyramid add fired exactly once per
+  # (market_id, bucket_label). Requires the dedup override above so the
+  # adds don't collide with the first entry.
+  - name: lazy
     enabled: true
     params:
-      cities: *weather_cities
-      require_confirmed_resolution: true
-      forecast_models: [noaa, open_meteo_gfs, open_meteo_ecmwf, open_meteo_icon]
-      forecast_model_weights:
-        noaa: 1.0
-        open_meteo_ecmwf: 1.0
-        open_meteo_icon: 1.0
-        open_meteo_gfs: 1.0
-      per_source_std_dev_f: {}
-      # Stricter agreement gate — only trade when models are tight.
-      min_agreement: 0.80
-      agreement_scale_f: 3.0
-      # Higher edge floor for primary; no adjacent-bucket trades at all.
-      min_edge_pct: 0.20
-      adjacent_min_edge_pct: 0.15
-      trade_adjacent_buckets: false
-      min_hours_to_resolution: 12
-      max_forecast_horizon_hours: 48
-      scan_interval_sec: 300
-      scan_on_model_update: true
-      min_liquidity_usd: 200.0    # require deeper books too
-      noaa_max_rps: 5.0
-
-  # ---- Weather: aggressive (looser edges, more opportunities) ----------
-  - name: weather_aggressive
-    enabled: true
-    params:
-      cities: *weather_cities
-      require_confirmed_resolution: true
-      forecast_models: [noaa, open_meteo_gfs, open_meteo_ecmwf, open_meteo_icon]
-      forecast_model_weights:
-        noaa: 1.0
-        open_meteo_ecmwf: 1.0
-        open_meteo_icon: 1.0
-        open_meteo_gfs: 1.0
-      per_source_std_dev_f: {}
-      # Tolerate more model disagreement.
-      min_agreement: 0.55
-      agreement_scale_f: 3.0
-      # Looser edge floors. Adjacent buckets allowed at very low edge.
-      min_edge_pct: 0.10
-      adjacent_min_edge_pct: 0.07
-      trade_adjacent_buckets: true
-      min_hours_to_resolution: 12
-      max_forecast_horizon_hours: 48
-      scan_interval_sec: 300
-      scan_on_model_update: true
-      min_liquidity_usd: 50.0
-      noaa_max_rps: 5.0
-
-  # ---- Lazy variants ---------------------------------------------------
-  # Each buys any temperature bucket whose YES price has reached its
-  # threshold and resolves within 12-48h, then holds. The `claimed_edge_pct`
-  # is the hypothesis we're testing — it's what the risk module uses for
-  # Kelly sizing. After resolution we'll see if the claim was justified.
-
-  - name: lazy_50
-    enabled: true
-    params:
-      price_threshold: 0.50       # 2x payoff if YES — the natural sweet spot
-      claimed_edge_pct: 0.10
-      max_price: 0.95
-      min_hours_to_resolution: 12
-      max_forecast_horizon_hours: 48
-      scan_interval_sec: 300
-      min_liquidity_usd: 100.0
-
-  - name: lazy_60
-    enabled: true
-    params:
-      price_threshold: 0.60       # ~1.67x payoff, stronger consensus
-      claimed_edge_pct: 0.10
-      max_price: 0.95
-      min_hours_to_resolution: 12
-      max_forecast_horizon_hours: 48
-      scan_interval_sec: 300
-      min_liquidity_usd: 100.0
-
-  - name: lazy_70
-    enabled: true
-    params:
-      price_threshold: 0.70       # ~1.43x payoff, very strong consensus
+      thresholds: [0.60, 0.65, 0.75, 0.85]
       claimed_edge_pct: 0.10
       max_price: 0.95
       min_hours_to_resolution: 12

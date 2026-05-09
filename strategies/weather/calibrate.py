@@ -186,6 +186,24 @@ def _print_report(
         print(f"  {city:<20} {len(errs):>8d} {rmse:>8.3f} {bias:>+8.3f} {flag:>10}")
     print()
 
+    # Per-city bias recommendation. Only emit cities whose |bias| crosses the
+    # apply-floor used by the strategy (default 0.5°F) AND have enough samples
+    # to be meaningful — anything else is noise that shouldn't be corrected.
+    bias_apply_floor_f = 0.5
+    bias_recs = [
+        (city, _bias(errs)) for city, errs in per_city_errors_f.items()
+        if len(errs) >= min_samples and abs(_bias(errs)) >= bias_apply_floor_f
+    ]
+    if bias_recs:
+        print(
+            f"Per-city bias recommendation (drop into weather strategy params; "
+            f"|bias| >= {bias_apply_floor_f}°F):"
+        )
+        print("  per_city_bias_f:")
+        for city, bias in sorted(bias_recs, key=lambda kv: -abs(kv[1])):
+            print(f"    {city}: {bias:+.2f}")
+        print()
+
     # Per-(city, source) breakdown when a city is anomalous.
     anomalous_cities = [c for c, errs in per_city_errors_f.items() if _rmse(errs) >= anomaly_rmse]
     if anomalous_cities:

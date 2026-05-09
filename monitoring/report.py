@@ -21,8 +21,8 @@ What's in here that perf_report.py is not:
   * `Brier` — mean squared error of the entry price as a probability
     estimate. 0.25 is the no-information baseline for binary markets.
   * `ROI%` — realized_pnl / deployed_in_resolved_trades. Win rate alone
-    can mislead (e.g., lazy_70 wins 70% by construction; the question is
-    whether $-weighted return is positive).
+    can mislead (a high-threshold lazy variant wins by construction; the
+    question is whether $-weighted return is positive).
   * Recent settled trades log + open positions log inline.
 
 All resolution-time filters use `metadata.resolved_at` (with timestamp

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Any
@@ -66,6 +66,11 @@ class RiskConfig:
     # and survives bot restarts (in-memory dedup sets don't). Set false if
     # you want a strategy to legitimately pyramid into a position.
     dedup_open_positions: bool = True
+    # Per-strategy override for `dedup_open_positions`. Strategies named here
+    # use the override; everything else uses the global default. Used by
+    # the lazy ladder: each price rung issues a fresh BUY on the same bucket,
+    # which the global dedup would otherwise reject as duplicate.
+    dedup_open_positions_per_strategy: dict[str, bool] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "RiskConfig":
@@ -84,7 +89,15 @@ class RiskConfig:
                 d.get("max_concurrent_positions_per_strategy", 0)
             ),
             dedup_open_positions=bool(d.get("dedup_open_positions", True)),
+            dedup_open_positions_per_strategy={
+                str(k): bool(v) for k, v in (d.get("dedup_open_positions_per_strategy") or {}).items()
+            },
         )
+
+    def dedup_for(self, strategy: str) -> bool:
+        if strategy in self.dedup_open_positions_per_strategy:
+            return self.dedup_open_positions_per_strategy[strategy]
+        return self.dedup_open_positions
 
 
 def _parse_tiers(raw: Any) -> list[VolumeTier]:
@@ -318,7 +331,7 @@ class RiskManager:
             # collide — that's intentional. A strategy that legitimately
             # wants both legs (e.g. arbitrage) can opt out by setting
             # `risk.dedup_open_positions: false` in config.
-            if self.config.dedup_open_positions:
+            if self.config.dedup_for(strategy):
                 duplicate = next(
                     (p for p in open_positions
                      if p.get("strategy") == strategy and p.get("market_id") == market_id),

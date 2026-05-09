@@ -85,9 +85,9 @@ def load_strategies(
             log.warning("Strategy %r enabled in config but module %s not found — skipping", name, module_path)
             continue
         # Find the BaseStrategy subclass defined IN this module (not just
-        # imported into it — variants like `weather_aggressive` re-import
-        # `WeatherStrategy` as their parent). Prefer a class whose `.name`
-        # matches the config entry's name; fall back to any class defined here.
+        # imported into it — e.g. `lazy` re-exports a thin subclass of
+        # `LazyWeatherStrategy`). Prefer a class whose `.name` matches the
+        # config entry's name; fall back to any class defined here.
         candidates: list[type] = []
         for attr in vars(mod).values():
             if (
@@ -571,7 +571,7 @@ async def run(config_path: Path) -> int:
 
     market_cache_ttl = float(cfg.get("market_cache", {}).get("default_ttl_sec", 30.0))
     market_cache = MarketCache(default_ttl_sec=market_cache_ttl)
-    context = StrategyContext(client=client, config=cfg, market_cache=market_cache)
+    context = StrategyContext(client=client, config=cfg, market_cache=market_cache, journal=journal)
     strategies = load_strategies(cfg, context, log)
     for s in strategies:
         if hasattr(s, "set_alert_hook"):

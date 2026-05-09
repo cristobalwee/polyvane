@@ -42,10 +42,11 @@ from .noaa import ForecastClient, all_known_sources
 GFS_RUN_HOURS = (0, 6, 12, 18)
 
 # Default forecast-model set when `forecast_models` isn't set in config.
+# Default forecast set drops ECMWF: the historical-archive endpoint
+# wasn't returning samples during calibration (verify before re-enabling).
 _DEFAULT_FORECAST_MODELS = [
     "noaa",
     "open_meteo_gfs",
-    "open_meteo_ecmwf",
     "open_meteo_icon",
 ]
 
@@ -80,6 +81,10 @@ class WeatherStrategy(BaseStrategy):
         self._min_edge: float = float(params.get("min_edge_pct", 0.15))
         self._adjacent_min_edge: float = float(params.get("adjacent_min_edge_pct", 0.10))
         self._trade_adjacent: bool = bool(params.get("trade_adjacent_buckets", True))
+        # Sanity cap on claimed edge. A 30%+ edge in a liquid binary market is
+        # almost always a model bug (probability inflation, sign error, bias
+        # uncorrected) — not real alpha. We log loudly and skip.
+        self._max_edge_sanity: float = float(params.get("max_edge_sanity", 0.30))
         self._min_hours: float = float(params.get("min_hours_to_resolution", 12))
         self._max_horizon_hours: float = float(params.get("max_forecast_horizon_hours", 48))
         self._scan_interval_sec: float = float(params.get("scan_interval_sec", 300))
@@ -92,10 +97,21 @@ class WeatherStrategy(BaseStrategy):
         models = params.get("forecast_models") or _DEFAULT_FORECAST_MODELS
         weights_cfg = params.get("forecast_model_weights") or {}
         self._model_weights = self._build_weights(models, weights_cfg)
-        self._min_agreement: float = float(params.get("min_agreement", 0.7))
+        # Default min_agreement = 0.0 (gate disabled). The historical 0.7+
+        # default was filtering 90%+ of signals and selection-biasing the
+        # surviving set toward correlated-bias forecasts — exactly the trades
+        # that lost most on conservative variants. Re-enable only after
+        # bias correction is in place and we can prove the gate adds value.
+        self._min_agreement: float = float(params.get("min_agreement", 0.0))
         self._agreement_scale_f: float = float(params.get("agreement_scale_f", 3.0))
         per_source_std = params.get("per_source_std_dev_f") or {}
         self._per_source_std: dict[str, float] = {k: float(v) for k, v in per_source_std.items()}
+        # Per-city bias correction. Subtracted from each member's mean before
+        # ensembling. Values come from calibrate.py output. Only applied when
+        # |bias| >= min_bias_apply_f to avoid over-correcting on noise.
+        bias_cfg = params.get("per_city_bias_f") or {}
+        self._per_city_bias_f: dict[str, float] = {k: float(v) for k, v in bias_cfg.items()}
+        self._min_bias_apply_f: float = float(params.get("min_bias_apply_f", 0.5))
 
         self._session: aiohttp.ClientSession | None = None
         self._gamma: GammaClient | None = None
@@ -163,15 +179,22 @@ class WeatherStrategy(BaseStrategy):
             per_source_std_dev_f=self._per_source_std or None,
             min_agreement=self._min_agreement,
             agreement_scale_f=self._agreement_scale_f,
+            per_city_bias_f=self._per_city_bias_f or None,
+            min_bias_apply_f=self._min_bias_apply_f,
+        )
+        bias_cities = sorted(
+            c for c, b in self._per_city_bias_f.items() if abs(b) >= self._min_bias_apply_f
         )
         self.log.info(
-            "WeatherStrategy ready: tradeable=%s skipped=%d models=%s min_edge=%.2f adj_edge=%.2f min_agreement=%.2f",
+            "WeatherStrategy ready: tradeable=%s skipped=%d models=%s min_edge=%.2f adj_edge=%.2f "
+            "min_agreement=%.2f bias_cities=%s",
             sorted(self._tradeable_cities),
             len(self._skipped_cities),
             list(self._model_weights.keys()),
             self._min_edge,
             self._adjacent_min_edge,
             self._min_agreement,
+            bias_cities,
         )
 
     async def teardown(self) -> None:
@@ -247,6 +270,14 @@ class WeatherStrategy(BaseStrategy):
         bucket_role = signal.metadata.get("bucket_role", "primary")
         edge_floor = self._min_edge if bucket_role == "primary" else self._adjacent_min_edge
         if signal.edge < edge_floor:
+            return None
+        if signal.edge > self._max_edge_sanity:
+            self.log.warning(
+                "skipping signal with implausibly large edge — likely model bug "
+                "(city=%s bucket=%s p=%.2f price=%.2f edge=%.2f cap=%.2f)",
+                signal.metadata.get("city"), signal.metadata.get("bucket"),
+                signal.confidence, signal.price, signal.edge, self._max_edge_sanity,
+            )
             return None
         liquidity = float(signal.metadata.get("liquidity_usd", 0.0))
         if liquidity < self._min_liquidity:
@@ -380,7 +411,9 @@ class WeatherStrategy(BaseStrategy):
             # the strategy can act on. Each WeatherMarket here carries exactly
             # one bucket (Gamma flattens that way).
             all_buckets = [b for m in group for b in m.buckets]
-            ensemble_result = self._ensemble.build(forecasts, all_buckets, sample.unit)
+            ensemble_result = self._ensemble.build(
+                forecasts, all_buckets, sample.unit, city=sample.city,
+            )
             if ensemble_result is None:
                 return (len(forecasts), 0, [])
             if ensemble_result.agreement_score < self._min_agreement:
@@ -394,6 +427,7 @@ class WeatherStrategy(BaseStrategy):
                 m.raw["ensemble_meta"] = {
                     "agreement_score": ensemble_result.agreement_score,
                     "ensemble_point": ensemble_result.point_forecast,
+                    "bias_applied_f": ensemble_result.bias_applied_f,
                     "ensemble_members": [
                         {"source": mb.source, "weight": mb.weight, "mean_f": mb.mean_f, "std_f": mb.std_f}
                         for mb in ensemble_result.members

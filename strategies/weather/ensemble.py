@@ -5,13 +5,22 @@ The ensemble treats each as a Gaussian and blends them into a weighted
 mixture; bucket probabilities come from integrating the mixture across each
 bucket's [low, high) range.
 
-Two outputs per market:
+Optionally applies a per-city bias correction before ensembling. The bias
+comes from `calibrate.py`'s 30-day forecast-vs-actual study and represents
+the city's historical warm-side error: positive bias means forecasts run
+warm and we subtract before computing bucket probs. Cities without a
+configured bias (or with |bias| below the apply-floor) pass through raw.
+
+Three outputs per market:
   - `bucket_probs`: model probability for every bucket in the market.
   - `agreement_score` in [0, 1]: how tightly the per-model point forecasts
     cluster, normalized by an expected-spread scale (in the canonical unit).
     1.0 = identical forecasts; ~0 = forecasts spread well beyond the typical
     forecast error. Below `min_agreement` the ensemble is suppressed and no
     signals are emitted for that market.
+  - `bias_applied_f`: amount subtracted from each member's mean for this
+    city. Logged into trade metadata so we can A/B corrected vs uncorrected
+    after the fact.
 
 Canonical internal unit is fahrenheit. Per-model forecasts are converted to
 fahrenheit on intake; output is converted back to the market's reporting unit
@@ -70,6 +79,11 @@ class EnsembleResult:
     unit: str                      # market's reporting unit
     agreement_score: float         # [0, 1]
     bucket_probs: dict[str, float]  # bucket label -> model probability
+    # Bias correction (°F) applied to each member's mean before ensembling.
+    # Positive = raw forecasts run warm; we subtracted this much from each
+    # member to land at point_forecast_f. 0.0 when no per-city correction
+    # is configured for the city, or when |bias| < min_bias_apply_f.
+    bias_applied_f: float = 0.0
 
 
 class EnsembleForecaster:
@@ -92,12 +106,29 @@ class EnsembleForecaster:
         # scale → ~0.37; 2x → ~0.14. Tuned to ~3°F by default — beyond a
         # 3°F spread across models, we should be skeptical.
         agreement_scale_f: float = 3.0,
+        # Per-city bias correction (°F). Each member's mean has the city's
+        # bias subtracted before ensembling. Positive bias = raw forecasts
+        # run warm; subtracting cools the corrected point. Sourced from
+        # calibrate.py per-city RMSE/bias output.
+        per_city_bias_f: dict[str, float] | None = None,
+        # Floor on |bias| to actually apply the correction. Below this,
+        # treat as noise and skip — protects cities with thin sample counts
+        # or near-zero bias from over-correction.
+        min_bias_apply_f: float = 0.5,
     ) -> None:
         self._client = client
         self._weights = dict(model_weights)
         self._stds = dict(per_source_std_dev_f or DEFAULT_MODEL_STD_DEV_F)
         self.min_agreement = float(min_agreement)
         self._agreement_scale_f = float(agreement_scale_f)
+        self._per_city_bias_f = {k: float(v) for k, v in (per_city_bias_f or {}).items()}
+        self._min_bias_apply_f = float(min_bias_apply_f)
+
+    def bias_for_city(self, city: str | None) -> float:
+        if not city:
+            return 0.0
+        b = self._per_city_bias_f.get(city, 0.0)
+        return b if abs(b) >= self._min_bias_apply_f else 0.0
 
     @property
     def configured_sources(self) -> list[str]:
@@ -147,13 +178,18 @@ class EnsembleForecaster:
         forecasts: Sequence[Forecast],
         buckets: Sequence[TemperatureBucket],
         market_unit: str,
+        *,
+        city: str | None = None,
     ) -> EnsembleResult | None:
         """Combine per-model forecasts into bucket probabilities + agreement.
 
         Internally everything works in fahrenheit; we convert per-model means
-        and the bucket bounds when the market reports in celsius.
+        and the bucket bounds when the market reports in celsius. When `city`
+        has a configured bias, each member's mean is corrected before any
+        downstream computation (point forecast, agreement, bucket probs).
         """
-        members = self._members_in_canonical_unit(forecasts)
+        bias_f = self.bias_for_city(city)
+        members = self._members_in_canonical_unit(forecasts, bias_f=bias_f)
         if not members:
             return None
 
@@ -179,16 +215,29 @@ class EnsembleForecaster:
             unit=market_unit,
             agreement_score=agreement,
             bucket_probs=bucket_probs,
+            bias_applied_f=bias_f,
         )
 
-    def _members_in_canonical_unit(self, forecasts: Sequence[Forecast]) -> list[ModelForecast]:
-        """Convert each forecast to fahrenheit, drop unweighted sources, renormalize."""
+    def _members_in_canonical_unit(
+        self,
+        forecasts: Sequence[Forecast],
+        *,
+        bias_f: float = 0.0,
+    ) -> list[ModelForecast]:
+        """Convert each forecast to fahrenheit, drop unweighted sources, renormalize.
+
+        When `bias_f != 0`, subtract it from each member's mean — the bias is
+        the historically-observed warm-direction error of the city's
+        forecasts (positive bias = forecasts run warm). Std and weights are
+        unchanged.
+        """
         members: list[ModelForecast] = []
         for f in forecasts:
             w = self._weights.get(f.source)
             if w is None or w <= 0:
                 continue
-            mean_f = f.temperature if f.unit == "fahrenheit" else c_to_f(f.temperature)
+            raw_mean_f = f.temperature if f.unit == "fahrenheit" else c_to_f(f.temperature)
+            mean_f = raw_mean_f - bias_f
             std_f = self.per_source_std_f(f.source)
             members.append(ModelForecast(source=f.source, weight=w, mean_f=mean_f, std_f=std_f))
         if not members:

@@ -3,8 +3,10 @@ hold to resolution.
 
 Pipeline (per scan):
   1. Pull all active temperature events from Gamma (no city filter).
-  2. For each bucket: if YES price >= price_threshold AND resolution window
-     in [min_hours, max_hours], emit a Signal.
+  2. For each bucket: if YES price clears one of the configured `thresholds`
+     AND resolution window in [min_hours, max_hours], emit a Signal — once
+     per (market_id, bucket_label, threshold). The first threshold is the
+     entry floor; higher thresholds are ladder adds (price-conviction pyramid).
   3. Edge reported is `claimed_edge_pct` — the *hypothesis* that consensus
      gives at least that much advantage over implied price. Trades are
      paper-mode only by default; resolution data updates the journal so
@@ -13,11 +15,13 @@ Pipeline (per scan):
 There is no forecasting, no calibration, no agreement gate. The "model" is
 simply: the crowd is right.
 
-Variants subclass this with a different `name` and different params (mainly
-`price_threshold`).
+The ladder requires `risk.dedup_open_positions = false` (or a per-strategy
+override) so that multiple buys on the same bucket can pyramid as price rises.
+The strategy enforces "each threshold fires at most once per bucket" itself.
 """
 from __future__ import annotations
 
+import json
 import math
 from datetime import datetime, timezone
 from typing import Any
@@ -34,7 +38,14 @@ class LazyWeatherStrategy(BaseStrategy):
 
     def __init__(self, params: dict[str, Any], context: StrategyContext) -> None:
         super().__init__(params, context)
-        self._price_threshold: float = float(params.get("price_threshold", 0.50))
+        # Ladder thresholds: entry floor first, then pyramid levels. Each fires
+        # at most once per (market_id, bucket_label). `price_threshold` is kept
+        # as a back-compat alias for a single-rung ladder.
+        thresholds = params.get("thresholds")
+        if thresholds is None:
+            single = params.get("price_threshold", 0.60)
+            thresholds = [single]
+        self._thresholds: list[float] = sorted(float(t) for t in thresholds)
         self._claimed_edge: float = float(params.get("claimed_edge_pct", 0.10))
         self._min_hours: float = float(params.get("min_hours_to_resolution", 12.0))
         self._max_hours: float = float(params.get("max_forecast_horizon_hours", 48.0))
@@ -46,9 +57,11 @@ class LazyWeatherStrategy(BaseStrategy):
         self._session: aiohttp.ClientSession | None = None
         self._scanner: LazyGammaScanner | None = None
         self._last_scan_at: datetime | None = None
-        # Track which (market_id, bucket_label) pairs we've already signalled
-        # in the current resolution window so we don't re-emit on every poll.
-        self._seen: set[tuple[str, str]] = set()
+        # Per-bucket ladder state: which thresholds have already fired.
+        # Survives across scans so a bucket bouncing between $0.59 and $0.61
+        # only triggers the $0.60 buy once. Does NOT survive bot restarts —
+        # the journal-side dedup catches that.
+        self._fired: dict[tuple[str, str], set[float]] = {}
 
     async def setup(self) -> None:
         self._session = aiohttp.ClientSession()
@@ -56,11 +69,53 @@ class LazyWeatherStrategy(BaseStrategy):
             self._session,
             request_timeout_sec=self._request_timeout_sec,
         )
+        self._hydrate_fired_from_journal()
+        ladder = ", ".join(f"${t:.2f}" for t in self._thresholds)
         self.log.info(
-            "LazyWeatherStrategy ready: threshold=$%.2f claimed_edge=%.2f window=%.0f-%.0fh min_liq=$%.0f",
-            self._price_threshold, self._claimed_edge,
+            "LazyWeatherStrategy ready: ladder=[%s] claimed_edge=%.2f window=%.0f-%.0fh min_liq=$%.0f",
+            ladder, self._claimed_edge,
             self._min_hours, self._max_hours, self._min_liquidity,
         )
+
+    def _hydrate_fired_from_journal(self) -> None:
+        """Restore `_fired` from the journal so a bot restart doesn't
+        re-fire ladder rungs that already have open positions.
+
+        The risk module's `(strategy, market_id)` dedup is OFF for this
+        strategy (required for ladder pyramiding), so the strategy itself
+        is the only thing preventing duplicate rung buys after restart.
+        Rows missing `metadata.ladder_threshold` are skipped — they
+        pre-date the ladder rollout and shouldn't seed the map.
+        """
+        journal = getattr(self.context, "journal", None)
+        if journal is None:
+            self.log.debug("no journal in context — skipping _fired hydration")
+            return
+        try:
+            rows = journal.open_positions()
+        except Exception:
+            self.log.warning("failed to read open positions for hydration", exc_info=True)
+            return
+        seeded_rungs = 0
+        for row in rows:
+            if row.get("strategy") != self.name:
+                continue
+            try:
+                meta = json.loads(row.get("metadata_json") or "{}")
+            except (TypeError, ValueError):
+                continue
+            bucket = meta.get("bucket")
+            threshold = meta.get("ladder_threshold")
+            if bucket is None or threshold is None:
+                continue
+            key = (str(row.get("market_id")), str(bucket))
+            self._fired.setdefault(key, set()).add(float(threshold))
+            seeded_rungs += 1
+        if seeded_rungs:
+            self.log.info(
+                "lazy: hydrated _fired from journal — %d open rungs across %d buckets",
+                seeded_rungs, len(self._fired),
+            )
 
     async def teardown(self) -> None:
         if self._session is not None:
@@ -80,44 +135,51 @@ class LazyWeatherStrategy(BaseStrategy):
         signals: list[Signal] = []
         candidates = 0
         skipped_window = 0
-        skipped_price = 0
+        skipped_below_floor = 0
+        skipped_max_price = 0
         skipped_liq = 0
-        skipped_seen = 0
+        skipped_already_fired = 0
 
+        floor = self._thresholds[0]
         for m in markets:
             hours_to_end = (m.end_date_utc - now).total_seconds() / 3600.0
             if hours_to_end < self._min_hours or hours_to_end > self._max_hours:
                 skipped_window += 1
                 continue
-            if m.yes_price < self._price_threshold or m.yes_price > self._max_price:
-                skipped_price += 1
+            if m.yes_price > self._max_price:
+                skipped_max_price += 1
+                continue
+            if m.yes_price < floor:
+                skipped_below_floor += 1
                 continue
             if m.liquidity_usd < self._min_liquidity:
                 skipped_liq += 1
                 continue
             key = (m.market_id, m.bucket_label)
-            if key in self._seen:
-                skipped_seen += 1
+            fired = self._fired.setdefault(key, set())
+            crossed = [t for t in self._thresholds if m.yes_price >= t and t not in fired]
+            if not crossed:
+                skipped_already_fired += 1
                 continue
-            self._seen.add(key)
-            candidates += 1
-            signals.append(self._make_signal(m))
+            for t in crossed:
+                fired.add(t)
+                candidates += 1
+                signals.append(self._make_signal(m, t))
 
-        # Garbage-collect _seen of entries whose markets are no longer in the
-        # active result set (they've resolved or been dropped from Gamma).
-        # Cheap O(n) check on every scan.
+        # Garbage-collect _fired entries whose markets are no longer in the
+        # active result set (resolved or dropped from Gamma).
         live_keys = {(m.market_id, m.bucket_label) for m in markets}
-        self._seen &= live_keys
+        self._fired = {k: v for k, v in self._fired.items() if k in live_keys}
 
         self.log.info(
             "lazy scan: %d markets total | %d candidate signals | "
-            "skipped: window=%d price=%d liq=%d seen=%d",
-            len(markets), candidates, skipped_window, skipped_price,
-            skipped_liq, skipped_seen,
+            "skipped: window=%d below_floor=%d max_price=%d liq=%d already_fired=%d",
+            len(markets), candidates, skipped_window, skipped_below_floor,
+            skipped_max_price, skipped_liq, skipped_already_fired,
         )
         return signals
 
-    def _make_signal(self, m: LazyMarket) -> Signal:
+    def _make_signal(self, m: LazyMarket, threshold: float) -> Signal:
         # Confidence reported = the price itself (i.e. crowd-implied prob).
         # Edge reported = the hypothesis we're testing (claimed_edge_pct).
         # The journal records both, so post-resolution we can measure
@@ -142,7 +204,8 @@ class LazyWeatherStrategy(BaseStrategy):
                 "end_utc": m.end_date_utc.isoformat(),
                 "liquidity_usd": m.liquidity_usd,
                 "volume_usd": m.volume_usd,
-                "price_threshold": self._price_threshold,
+                "ladder_threshold": threshold,
+                "ladder_thresholds": list(self._thresholds),
                 "claimed_edge_pct": self._claimed_edge,
                 "lazy_thesis": "crowd_consensus",
                 "neg_risk": True,  # temperature buckets are negative-risk markets
@@ -163,11 +226,12 @@ class LazyWeatherStrategy(BaseStrategy):
             if hours_left < self._min_hours or hours_left > self._max_hours:
                 return None
 
+        threshold = signal.metadata.get("ladder_threshold", self._thresholds[0])
         return TradeIntent(
             signal=signal,
             size_usd_hint=None,  # let the risk module size via Kelly
             reason=(
-                f"lazy[t=${self._price_threshold:.2f}]: "
+                f"lazy[rung=${threshold:.2f}]: "
                 f"{signal.metadata.get('city')} {signal.metadata.get('bucket')} "
                 f"@ ${signal.price:.2f} "
                 f"(claimed_edge={self._claimed_edge:.2f}, "
