@@ -1,0 +1,30 @@
+[Unit]
+Description=PolyVane API (read-only HTTP layer)
+After=network-online.target
+Wants=network-online.target
+# Crash-loop containment matches the bot service.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=polyvane
+Group=polyvane
+WorkingDirectory=/opt/polyvane
+EnvironmentFile=/opt/polyvane/.env
+ExecStart=/opt/polyvane/venv/bin/uvicorn api.server:app --host 0.0.0.0 --port 8099 --proxy-headers
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# The API only needs to read data/. logs/ stays writable so uvicorn's
+# access log can land somewhere if the operator turns it on.
+ReadWritePaths=/opt/polyvane/logs
+ReadOnlyPaths=/opt/polyvane/data
+PrivateTmp=true
+StandardOutput=journal
+StandardError=append:/opt/polyvane/logs/polyvane-api-error.log
+
+[Install]
+WantedBy=multi-user.target

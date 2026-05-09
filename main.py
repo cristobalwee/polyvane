@@ -299,28 +299,52 @@ async def daily_summary_loop(
         try:
             now = utc_now()
             if is_summary_due(now, alert_cfg, last_sent):
+                # Force-resolve any pending trades whose markets have settled
+                # on Polymarket. Without this, settled-but-not-yet-flipped
+                # positions show up in the "open" list with mark="—" and
+                # their P/L is invisible in the summary.
+                try:
+                    closed_now = await reviewer.check_resolutions()
+                    if closed_now:
+                        log.info(
+                            "daily_summary: reviewer settled %d trade(s) before composing summary",
+                            closed_now,
+                        )
+                except Exception:
+                    log.exception("daily_summary: reviewer.check_resolutions() raised")
+
                 summary = reviewer.compute_review_metrics(period="daily", since_days=1, persist=False)
-                day_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+                day_start_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                day_start = day_start_dt.isoformat()
                 realized = journal.realized_pnl_since(day_start)
                 trades_today = journal.count_entries_since(day_start)
                 open_rows = journal.open_positions()
 
-                # Per-strategy breakdown via the perf_report collector.
+                # Trades that resolved between the last summary and now (or
+                # since day start on first run). These are the ones whose
+                # outcome you'd otherwise have no way to see in Discord.
+                resolutions_since = (last_sent or day_start_dt).isoformat()
+                resolved_rows = journal.closed_since(resolutions_since)
+                per_strategy_resolutions = _group_resolutions_by_strategy(resolved_rows)
+
+                # Per-strategy breakdown — use monitoring.report so the row
+                # carries calibration_delta / implied_win_rate too. Same
+                # entry/resolution filter discipline as perf_report.
                 per_strategy: list[dict] = []
                 try:
-                    from monitoring.perf_report import collect, to_json
-                    stats = collect(
-                        journal.db_path,
-                        since=now.replace(hour=0, minute=0, second=0, microsecond=0),
-                    )
-                    rows = to_json(stats)
+                    from monitoring.report import _collect_view, _connect, _view_to_json
+                    with _connect(journal.db_path) as conn:
+                        views = _collect_view(
+                            conn,
+                            since=now.replace(hour=0, minute=0, second=0, microsecond=0),
+                        )
                     per_strategy = [
-                        {"strategy": k, **v}
-                        for k, v in rows.items()
-                        if v["trades"] > 0 or v["open_positions"] > 0
+                        _view_to_json(v)
+                        for v in sorted(views.values(), key=lambda x: x.strategy)
+                        if v.trades > 0 or v.open_positions > 0
                     ]
                 except Exception:
-                    log.exception("perf_report.collect() failed in daily summary")
+                    log.exception("monitoring.report view collection failed in daily summary")
 
                 per_strategy_positions = await _build_open_positions_by_strategy(
                     open_rows, client, log,
@@ -333,6 +357,8 @@ async def daily_summary_loop(
                     "open_positions": len(open_rows),
                     "per_strategy": per_strategy,
                     "per_strategy_positions": per_strategy_positions,
+                    "per_strategy_resolutions": per_strategy_resolutions,
+                    "resolutions_since": resolutions_since,
                 })
                 last_sent = now
         except Exception:
@@ -341,6 +367,34 @@ async def daily_summary_loop(
             await asyncio.wait_for(stop_event.wait(), timeout=interval_sec)
         except asyncio.TimeoutError:
             pass
+
+
+def _group_resolutions_by_strategy(
+    resolved_rows: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Parse metadata_json once and group settled trades by strategy.
+
+    Each row carries the fields the alert formatter needs (city, bucket,
+    direction, entry, outcome, pnl) so it doesn't have to touch the DB.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for r in resolved_rows:
+        try:
+            meta = json.loads(r.get("metadata_json") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            meta = {}
+        grouped.setdefault(r.get("strategy") or "unknown", []).append({
+            "trade_id": r.get("id"),
+            "strategy": r.get("strategy"),
+            "market_id": r.get("market_id"),
+            "direction": r.get("direction"),
+            "entry_price": r.get("entry_price"),
+            "size_usd": r.get("size_usd"),
+            "outcome": r.get("outcome"),
+            "pnl": r.get("pnl"),
+            "metadata": meta,
+        })
+    return grouped
 
 
 async def _build_open_positions_by_strategy(
@@ -436,8 +490,8 @@ async def run(config_path: Path) -> int:
 
     journal = TradeJournal(PROJECT_ROOT / cfg["logger"]["db_path"])
 
-    risk = RiskManager(RiskConfig.from_dict(cfg["risk"]), journal)
     exec_cfg = ExecutionConfig.from_dict(cfg["execution"])
+    risk = RiskManager(RiskConfig.from_dict(cfg["risk"]), journal, is_paper=exec_cfg.is_paper)
     client = ClobClient(ClientConfig.from_dict(cfg["api"]))
     wallet = Wallet(WalletConfig(rpc_url=os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")))
 
@@ -617,6 +671,8 @@ async def run(config_path: Path) -> int:
         )
 
     log.info("Event loop running with %d strategy task(s).", len(strategies))
+    if exec_cfg.is_paper:
+        log.info("Paper mode: circuit breaker disabled — daily-loss halt will not engage.")
     await stop_event.wait()
     log.info("Stop requested. Cancelling %d task(s)...", len(tasks))
     for t in tasks:
@@ -673,11 +729,10 @@ async def _smoke_test(config_path: Path) -> int:
     journal = TradeJournal(PROJECT_ROOT / cfg["logger"]["db_path"])
     log.info("Trade journal initialized at %s", journal.db_path)
 
-    risk = RiskManager(RiskConfig.from_dict(cfg["risk"]), journal)
+    exec_cfg = ExecutionConfig.from_dict(cfg["execution"])
+    risk = RiskManager(RiskConfig.from_dict(cfg["risk"]), journal, is_paper=exec_cfg.is_paper)
     log.info("Risk manager initialized (kelly_fraction=%s, max_position_usd=%s)",
              risk.config.kelly_fraction, risk.config.max_position_usd)
-
-    exec_cfg = ExecutionConfig.from_dict(cfg["execution"])
     log.info("Execution config: mode=%s order_type=%s staged=%s",
              exec_cfg.mode, exec_cfg.order_type, exec_cfg.staged_entry)
 

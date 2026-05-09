@@ -49,10 +49,33 @@ class ResolutionSource:
 
 
 # Cities we have NOT yet personally confirmed a resolution station for. Listed
-# here (vs omitted) so the alert + skip-with-warning machinery can flag them.
+# here (vs omitted) so the alert + skip-with-warning machinery can flag them,
+# AND so the bot doesn't keep firing `new_city_detected` alerts on every scan.
+# Best-guess station per row; flip `confirmed=True` after verifying one resolution.
 _UNCONFIRMED = {
-    "Seoul":   "Source TBD — likely KMA but station unverified",
-    "Shanghai": "Source TBD — likely CMA Pudong/Hongqiao but station unverified",
+    "Seoul":      "Source TBD — likely KMA but station unverified",
+    "Shanghai":   "Source TBD — likely CMA Pudong/Hongqiao but station unverified",
+    "Beijing":    "Source TBD — likely CMA Beijing Capital but station unverified",
+    "Tokyo":      "Source TBD — likely JMA Tokyo but station/airport unverified",
+    "Singapore":  "Source TBD — likely Changi (WSSS) but station unverified",
+    "Mexico City": "Source TBD — likely Benito Juarez (MMMX) but station unverified",
+    "Sao Paulo":  "Source TBD — likely Guarulhos (SBGR) or Congonhas (SBSP) — unverified",
+    "Buenos Aires": "Source TBD — likely Ezeiza (SAEZ) or Aeroparque (SABE) — unverified",
+    "Madrid":     "Source TBD — likely Barajas (LEMD) but unverified",
+    "Paris":      "Source TBD — likely Charles de Gaulle (LFPG) or Orly (LFPO) — unverified",
+    "Munich":     "Source TBD — likely Franz Josef Strauss (EDDM) but unverified",
+    "Amsterdam":  "Source TBD — likely Schiphol (EHAM) but unverified",
+    "Helsinki":   "Source TBD — likely Helsinki-Vantaa (EFHK) but unverified",
+    "Tel Aviv":   "Source TBD — likely Ben Gurion (LLBG) but unverified",
+    "Istanbul":   "Source TBD — IST (LTFM) vs SAW (LTFJ) ambiguous — unverified",
+    "Moscow":     "Source TBD — likely Sheremetyevo (UUEE) but unverified",
+    "Warsaw":     "Source TBD — likely Chopin (EPWA) but unverified",
+    "Milan":      "Source TBD — Malpensa (LIMC) vs Linate (LIML) ambiguous — unverified",
+    "Cape Town":  "Source TBD — likely Cape Town International (FACT) but unverified",
+    "Manila":     "Source TBD — likely NAIA (RPLL) but unverified",
+    "Jakarta":    "Source TBD — likely Soekarno-Hatta (WIII) but unverified",
+    "Taipei":     "Source TBD — Songshan (RCSS) vs Taoyuan (RCTP) ambiguous — unverified",
+    "Busan":      "Source TBD — likely Gimhae (RKPK) but unverified",
 }
 
 
@@ -142,6 +165,179 @@ _REGISTRY: dict[str, ResolutionSource] = {
         unit="celsius",
         confirmed=False,
         notes=_UNCONFIRMED["Shanghai"],
+    ),
+
+    # ---- Major US airports (NWS-covered; Wunderground typically resolves to these) ----
+    "Austin": ResolutionSource(
+        city="Austin",
+        station_name="Austin-Bergstrom International",
+        station_id="KAUS",
+        data_provider="wunderground",
+        lat=30.1945, lon=-97.6699,
+        unit="fahrenheit",
+    ),
+    "Chicago": ResolutionSource(
+        city="Chicago",
+        station_name="O'Hare International",
+        station_id="KORD",
+        data_provider="wunderground",
+        lat=41.9742, lon=-87.9073,
+        unit="fahrenheit",
+    ),
+    "Denver": ResolutionSource(
+        city="Denver",
+        station_name="Denver International",
+        station_id="KDEN",
+        data_provider="wunderground",
+        lat=39.8561, lon=-104.6737,
+        unit="fahrenheit",
+    ),
+    "Houston": ResolutionSource(
+        city="Houston",
+        station_name="George Bush Intercontinental",
+        station_id="KIAH",
+        data_provider="wunderground",
+        lat=29.9902, lon=-95.3368,
+        unit="fahrenheit",
+    ),
+    "Los Angeles": ResolutionSource(
+        city="Los Angeles",
+        station_name="Los Angeles International",
+        station_id="KLAX",
+        data_provider="wunderground",
+        lat=33.9416, lon=-118.4085,
+        unit="fahrenheit",
+    ),
+    "Miami": ResolutionSource(
+        city="Miami",
+        station_name="Miami International",
+        station_id="KMIA",
+        data_provider="wunderground",
+        lat=25.7959, lon=-80.2870,
+        unit="fahrenheit",
+    ),
+    "San Francisco": ResolutionSource(
+        city="San Francisco",
+        station_name="San Francisco International",
+        station_id="KSFO",
+        data_provider="wunderground",
+        lat=37.6213, lon=-122.3790,
+        unit="fahrenheit",
+    ),
+    "Seattle": ResolutionSource(
+        city="Seattle",
+        station_name="Seattle-Tacoma International",
+        station_id="KSEA",
+        data_provider="wunderground",
+        lat=47.4502, lon=-122.3088,
+        unit="fahrenheit",
+    ),
+
+    # ---- International — best-guess station, marked unconfirmed until verified ----
+    "Beijing": ResolutionSource(
+        city="Beijing", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=39.9042, lon=116.4074,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Beijing"],
+    ),
+    "Tokyo": ResolutionSource(
+        city="Tokyo", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=35.6762, lon=139.6503,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Tokyo"],
+    ),
+    "Singapore": ResolutionSource(
+        city="Singapore", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=1.3521, lon=103.8198,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Singapore"],
+    ),
+    "Mexico City": ResolutionSource(
+        city="Mexico City", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=19.4326, lon=-99.1332,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Mexico City"],
+    ),
+    "Sao Paulo": ResolutionSource(
+        city="Sao Paulo", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=-23.5505, lon=-46.6333,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Sao Paulo"],
+    ),
+    "Buenos Aires": ResolutionSource(
+        city="Buenos Aires", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=-34.6037, lon=-58.3816,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Buenos Aires"],
+    ),
+    "Madrid": ResolutionSource(
+        city="Madrid", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=40.4168, lon=-3.7038,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Madrid"],
+    ),
+    "Paris": ResolutionSource(
+        city="Paris", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=48.8566, lon=2.3522,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Paris"],
+    ),
+    "Munich": ResolutionSource(
+        city="Munich", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=48.1351, lon=11.5820,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Munich"],
+    ),
+    "Amsterdam": ResolutionSource(
+        city="Amsterdam", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=52.3676, lon=4.9041,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Amsterdam"],
+    ),
+    "Helsinki": ResolutionSource(
+        city="Helsinki", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=60.1699, lon=24.9384,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Helsinki"],
+    ),
+    "Tel Aviv": ResolutionSource(
+        city="Tel Aviv", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=32.0853, lon=34.7818,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Tel Aviv"],
+    ),
+    "Istanbul": ResolutionSource(
+        city="Istanbul", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=41.0082, lon=28.9784,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Istanbul"],
+    ),
+    "Moscow": ResolutionSource(
+        city="Moscow", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=55.7558, lon=37.6173,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Moscow"],
+    ),
+    "Warsaw": ResolutionSource(
+        city="Warsaw", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=52.2297, lon=21.0122,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Warsaw"],
+    ),
+    "Milan": ResolutionSource(
+        city="Milan", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=45.4642, lon=9.1900,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Milan"],
+    ),
+    "Cape Town": ResolutionSource(
+        city="Cape Town", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=-33.9249, lon=18.4241,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Cape Town"],
+    ),
+    "Manila": ResolutionSource(
+        city="Manila", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=14.5995, lon=120.9842,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Manila"],
+    ),
+    "Jakarta": ResolutionSource(
+        city="Jakarta", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=-6.2088, lon=106.8456,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Jakarta"],
+    ),
+    "Taipei": ResolutionSource(
+        city="Taipei", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=25.0330, lon=121.5654,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Taipei"],
+    ),
+    "Busan": ResolutionSource(
+        city="Busan", station_name="(unconfirmed)", station_id="",
+        data_provider="wunderground", lat=35.1796, lon=129.0756,
+        unit="celsius", confirmed=False, notes=_UNCONFIRMED["Busan"],
     ),
 }
 

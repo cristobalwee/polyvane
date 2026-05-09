@@ -137,8 +137,22 @@ paper_bankroll_per_strategy:
 
 # Reusable city list. YAML anchors keep the three weather variants in sync
 # without duplicating the list.
+#
+# Cities marked confirmed=False in strategies/weather/resolution.py are
+# still listed here so the bot recognizes their event titles (silencing
+# `new_city_detected` alerts). They get filtered out at startup by
+# `require_confirmed_resolution`. Flip the registry entry to confirmed=True
+# after verifying one resolution against Wunderground to enable trading.
 _weather_cities: &weather_cities
-  [NYC, Dallas, Atlanta, London, Hong Kong, Toronto, Ankara, Wellington, Seoul, Shanghai]
+  [
+    # Confirmed (trade enabled when require_confirmed_resolution: true)
+    NYC, Dallas, Atlanta, London, Hong Kong, Toronto, Ankara, Wellington,
+    Austin, Chicago, Denver, Houston, Los Angeles, Miami, San Francisco, Seattle,
+    # Unconfirmed — verify station before flipping confirmed=True
+    Seoul, Shanghai, Beijing, Tokyo, Singapore, Mexico City, Sao Paulo,
+    Buenos Aires, Madrid, Paris, Munich, Amsterdam, Helsinki, Tel Aviv,
+    Istanbul, Moscow, Warsaw, Milan, Cape Town, Manila, Jakarta, Taipei, Busan,
+  ]
 
 # Strategy registry. Each entry: name (must match a module under strategies/),
 # enabled flag, and a free-form `params` block passed to the strategy at init.

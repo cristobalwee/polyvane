@@ -160,7 +160,7 @@ class AlertBus:
         if event.event_type == "daily_summary":
             messages = format_daily_summary_messages(event.payload, self.config)
         else:
-            messages = [format_message(event.event_type, event.payload)]
+            messages = [format_message(event.event_type, event.payload, cfg=self.config)]
         for msg in messages:
             if self.config.has_discord:
                 await self._post_discord(msg, event)
@@ -240,19 +240,23 @@ def _format_resolution_date(end_iso: str) -> str:
 
 
 def format_daily_summary_messages(payload: dict[str, Any], cfg: AlertConfig) -> list[str]:
-    """Return the head message + one detail message per strategy with open positions.
+    """Head message + one detail message per strategy.
 
-    Detail messages list every open trade for the strategy (city, resolution
-    date, cost basis, exposure, unrealized P/L). Long strategy sections are
-    split at trade boundaries to stay under Discord's 2000-char content cap.
+    Each detail message lists trades that settled since the last summary
+    (with final P/L) and trades that are still open, one line each. Long
+    sections are split at trade boundaries to stay under Discord's
+    2000-char content cap.
     """
     messages: list[str] = [_format_summary_head(payload, cfg)]
     per_positions: dict[str, list[dict[str, Any]]] = payload.get("per_strategy_positions") or {}
-    for strategy in sorted(per_positions.keys()):
-        positions = per_positions[strategy] or []
-        if not positions:
+    per_resolutions: dict[str, list[dict[str, Any]]] = payload.get("per_strategy_resolutions") or {}
+    strategies = sorted(set(per_positions) | set(per_resolutions))
+    for strategy in strategies:
+        positions = per_positions.get(strategy) or []
+        resolutions = per_resolutions.get(strategy) or []
+        if not positions and not resolutions:
             continue
-        messages.extend(_format_strategy_detail(strategy, positions))
+        messages.extend(_format_strategy_detail(strategy, positions, resolutions))
     return messages
 
 
@@ -268,72 +272,175 @@ def _format_summary_head(payload: dict[str, Any], cfg: AlertConfig) -> str:
     per_strategy = payload.get("per_strategy") or []
     if not per_strategy:
         return head
+    # `calib` = actual_win_rate − implied_win_rate (entry-price-implied prob).
+    # Positive means the strategy is winning more than the price predicted —
+    # the headline diagnostic for "is there real edge?". Source: each row
+    # may carry `calibration_delta` (from monitoring.report._view_to_json);
+    # legacy rows from perf_report won't, in which case we render '-'.
     rows = ["```"]
-    rows.append(f"{'strategy':<22} {'tr':>3} {'op':>3} {'expo':>9} {'pnl':>9} {'wr':>5}")
+    rows.append(
+        f"{'strategy':<22} {'tr':>3} {'op':>3} "
+        f"{'expo':>9} {'pnl':>9} {'wr':>5} {'calib':>5}"
+    )
     for s in per_strategy:
         wr = f"{s['win_rate']:.0%}" if s.get("win_rate") is not None else "  -"
+        cd = s.get("calibration_delta")
+        calib = f"{cd:+.0%}" if isinstance(cd, (int, float)) else "  -"
+        pnl = float(s["realized_pnl_usd"])
+        pnl_str = f"{'-' if pnl < 0 else '+'}${abs(pnl):,.2f}"
         rows.append(
             f"{s['strategy']:<22} "
             f"{s['trades']:>3d} "
             f"{s['open_positions']:>3d} "
             f"${s['open_exposure_usd']:>7,.0f} "
-            f"{('+' if s['realized_pnl_usd'] >= 0 else ''):>1}${abs(s['realized_pnl_usd']):>6,.2f} "
-            f"{wr:>5}"
+            f"{pnl_str:>8} "
+            f"{wr:>5} "
+            f"{calib:>5}"
         )
     rows.append("```")
     return head + "\n" + "\n".join(rows)
 
 
-def _format_strategy_detail(strategy: str, positions: list[dict[str, Any]]) -> list[str]:
-    """One or more messages detailing every open position for a strategy.
+def _format_strategy_detail(
+    strategy: str,
+    positions: list[dict[str, Any]],
+    resolutions: list[dict[str, Any]],
+) -> list[str]:
+    """One or more messages summarizing a strategy's settled and open trades.
 
-    Split into multiple messages if the rendered content exceeds Discord's
-    content limit, breaking only at trade boundaries.
+    Layout:
+        ━━━ <strategy> — N open · cost · expo · P/L (unrealized)
+        ✅/❌ <one-line settled trade>
+        …
+        · YES/NO  <one-line open position>
+        …
+
+    Long sections split at line boundaries to fit Discord's content cap.
     """
     cost_total = sum(float(p.get("size_usd") or 0.0) for p in positions)
     expo_total = sum(_position_exposure_usd(p) for p in positions)
     pnl_total = sum(_position_unrealized_pnl(p) or 0.0 for p in positions)
     pnl_known = any(_position_unrealized_pnl(p) is not None for p in positions)
-    pnl_str = f"{'+' if pnl_total >= 0 else ''}${pnl_total:,.2f}" if pnl_known else "—"
+    pnl_str = _format_signed_usd(pnl_total) if pnl_known else "—"
 
-    header = (
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📂 **{strategy}** — {len(positions)} open · "
-        f"cost ${cost_total:,.2f} · expo ${expo_total:,.2f} · P/L {pnl_str}"
-    )
+    header_parts = [
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📂 **{strategy}** — {len(positions)} open · cost ${cost_total:,.2f} · "
+        f"expo ${expo_total:,.2f} · P/L {pnl_str}",
+    ]
+    if resolutions:
+        wins = sum(1 for r in resolutions if r.get("outcome") == "won")
+        realized = sum(float(r.get("pnl") or 0.0) for r in resolutions)
+        realized_str = _format_signed_usd(realized)
+        header_parts.append(
+            f"  settled since last summary: {len(resolutions)} "
+            f"({wins}W/{len(resolutions) - wins}L) · realized {realized_str}"
+        )
+    header = "\n".join(header_parts)
 
-    lines = [_format_position_block(p) for p in positions]
+    lines: list[str] = []
+    for r in resolutions:
+        lines.append(_format_resolution_line(r))
+    if resolutions and positions:
+        lines.append("  · open ·")
+    for p in positions:
+        lines.append(_format_position_line(p))
 
     chunks: list[str] = []
     current = header
-    for block in lines:
-        candidate = f"{current}\n\n{block}"
+    for line in lines:
+        candidate = f"{current}\n{line}"
         if len(candidate) > _DISCORD_CONTENT_LIMIT:
             chunks.append(current)
-            # Continuation header keeps context but stays light.
-            current = f"📂 **{strategy}** _(cont.)_\n\n{block}"
+            current = f"📂 **{strategy}** _(cont.)_\n{line}"
         else:
             current = candidate
     chunks.append(current)
     return chunks
 
 
-def _format_position_block(p: dict[str, Any]) -> str:
+def _format_position_line(p: dict[str, Any]) -> str:
+    """Single-line summary of an open position.
+
+    Format: `  YES NYC 75-80°F (in 3d) · $3.00 @ 0.250 → 0.300 · +$0.60`
+    Falls back gracefully when metadata fields are missing.
+    """
     meta = p.get("metadata") or {}
-    meta_line = _format_market_meta_line(meta) or "(no market metadata)"
+    direction = p.get("direction") or ""
+    label = _format_market_label(meta) or str(p.get("market_id") or "?")[:8]
     entry = float(p.get("entry_price") or 0.0)
     size = float(p.get("size_usd") or 0.0)
-    expo = _position_exposure_usd(p)
     pnl = _position_unrealized_pnl(p)
     mark = p.get("mark_price")
-    mark_str = f"{mark:.3f}" if isinstance(mark, (int, float)) else "—"
-    pnl_str = f"{'+' if pnl >= 0 else ''}${pnl:,.2f}" if pnl is not None else "—"
-    direction = p.get("direction") or ""
+    end_iso = meta.get("end_utc") or meta.get("end_date_utc")
+    end_short = _format_relative(end_iso) if end_iso else ""
+    if isinstance(mark, (int, float)):
+        mark_str = f"{mark:.3f}"
+        pnl_str = _format_signed_usd(pnl) if pnl is not None else "—"
+    elif end_short == "past":
+        mark_str = "settled?"
+        pnl_str = "awaiting"
+    else:
+        mark_str = "—"
+        pnl_str = "—"
+    when = f" ({end_short})" if end_short else ""
     return (
-        f"  {direction} `{p.get('market_id')}`\n"
-        f"  {meta_line}\n"
-        f"  💵 cost ${size:,.2f} @ {entry:.3f}  →  mark {mark_str}  ·  expo ${expo:,.2f}  ·  P/L {pnl_str}"
+        f"  {direction} {label}{when} · "
+        f"${size:,.2f} @ {entry:.3f} → {mark_str} · {pnl_str}"
     )
+
+
+def _format_resolution_line(r: dict[str, Any]) -> str:
+    """Single-line summary of a settled trade.
+
+    Format: `  ✅ NYC 75-80°F won @ 0.250 → +$3.00`
+    """
+    meta = r.get("metadata") or {}
+    label = _format_market_label(meta) or str(r.get("market_id") or "?")[:8]
+    direction = r.get("direction") or ""
+    outcome = r.get("outcome") or "?"
+    icon = "✅" if outcome == "won" else "❌"
+    entry = float(r.get("entry_price") or 0.0)
+    pnl = r.get("pnl")
+    pnl_str = _format_signed_usd(pnl) if pnl is not None else "—"
+    return f"  {icon} {direction} {label} {outcome} @ {entry:.3f} → {pnl_str}"
+
+
+def _format_market_label(meta: dict[str, Any]) -> str:
+    """Compact `<city> <bucket><unit>` label, dropping pieces we don't have."""
+    parts: list[str] = []
+    city = meta.get("city")
+    if city:
+        parts.append(str(city))
+    bucket = meta.get("bucket")
+    if bucket:
+        unit = meta.get("unit") or ""
+        unit_short = "°F" if unit.startswith("f") else ("°C" if unit.startswith("c") else "")
+        parts.append(f"{bucket}{unit_short}")
+    return " ".join(parts)
+
+
+def _format_signed_usd(value: float) -> str:
+    """Render `$1.10` / `-$3.00` (sign always before the dollar sign)."""
+    return f"{'-' if value < 0 else '+'}${abs(value):,.2f}"
+
+
+def _format_relative(end_iso: str) -> str:
+    """`2026-05-08T18:00:00+00:00` → `in 3d` / `in 4h` / `past`."""
+    try:
+        end_dt = datetime.fromisoformat(end_iso)
+    except (ValueError, TypeError):
+        return ""
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=timezone.utc)
+    secs = int((end_dt - datetime.now(timezone.utc)).total_seconds())
+    if secs < 0:
+        return "past"
+    if secs < 3600:
+        return f"in {max(1, secs // 60)}m"
+    if secs < 86_400:
+        return f"in {secs // 3600}h"
+    return f"in {secs // 86_400}d"
 
 
 def _position_exposure_usd(p: dict[str, Any]) -> float:
@@ -354,12 +461,19 @@ def _position_unrealized_pnl(p: dict[str, Any]) -> float | None:
     return float(mark) * float(shares) - float(p.get("size_usd") or 0.0)
 
 
-def format_message(event_type: str, payload: dict[str, Any]) -> str:
+def format_message(
+    event_type: str,
+    payload: dict[str, Any],
+    *,
+    cfg: AlertConfig | None = None,
+) -> str:
     """Render a clean human-readable message. Channel-agnostic.
 
     Each event type gets a small, predictable layout — easier to skim than a
-    raw payload dump.
+    raw payload dump. `cfg` is consulted only for events that need a Discord
+    @mention (currently: circuit_breaker), and is optional for back-compat.
     """
+    cfg = cfg or AlertConfig()
     if event_type == "trade_executed":
         head = (
             f"📈 **Trade**: {payload.get('strategy')} {payload.get('direction')} "
@@ -371,7 +485,7 @@ def format_message(event_type: str, payload: dict[str, Any]) -> str:
         return f"{head}\n{meta_line}" if meta_line else head
     if event_type == "daily_summary":
         # Kept for back-compat callers that want a single-string render.
-        return format_daily_summary_messages(payload, AlertConfig())[0]
+        return format_daily_summary_messages(payload, cfg)[0]
     if event_type == "drawdown_warning":
         frac = payload.get("fraction_of_limit", 0.0)
         return (
@@ -380,8 +494,11 @@ def format_message(event_type: str, payload: dict[str, Any]) -> str:
             f"({frac:.0%} of -${payload.get('daily_loss_limit_usd', 0.0):.0f} limit)"
         )
     if event_type == "circuit_breaker":
+        # Live-mode only (paper-mode RiskManager never emits this), so always
+        # ping the operator — this is the "real money is bleeding" alarm.
+        ping = f"<@{cfg.discord_user_id}> " if cfg.discord_user_id else ""
         return (
-            f"🛑 **CIRCUIT BREAKER** — trading halted. "
+            f"{ping}🛑 **CIRCUIT BREAKER** — trading halted. "
             f"PnL: ${payload.get('realized_pnl_usd', 0.0):+.2f} / "
             f"-${payload.get('daily_loss_limit_usd', 0.0):.0f}"
         )

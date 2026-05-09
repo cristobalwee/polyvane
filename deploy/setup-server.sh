@@ -15,6 +15,8 @@ fi
 USER_NAME="polyvane"
 INSTALL_DIR="/opt/polyvane"
 SERVICE_NAME="polyvane"
+API_SERVICE_NAME="polyvane-api"
+API_PORT="8099"
 HEALTHCHECK_INTERVAL="*/5 * * * *"
 
 log()  { printf '\e[1;34m[setup]\e[0m %s\n' "$*"; }
@@ -148,11 +150,14 @@ systemctl reload ssh || systemctl reload sshd || warn "could not reload sshd"
 
 # ---- 4. Firewall ------------------------------------------------------------
 
-log "ufw: allow SSH only"
+log "ufw: allow SSH + API port"
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow 22/tcp
+# API for the remote dashboard. If you put nginx in front later, drop this
+# and only expose 443.
+ufw allow ${API_PORT}/tcp
 ufw --force enable
 
 # ---- 5. Directory layout ----------------------------------------------------
@@ -194,6 +199,11 @@ POLYGON_RPC_URL=https://polygon-rpc.com
 
 LOGS_DIR=/opt/polyvane/logs
 HEARTBEAT_FILE=/opt/polyvane/data/heartbeat
+
+# API — fill these in before starting polyvane-api.service.
+# Generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+API_SECRET_KEY=
+DASHBOARD_ORIGINS=https://cristobalgrana.me,http://localhost:5173
 EOF
 fi
 chmod 600 "$INSTALL_DIR/.env"
@@ -202,12 +212,14 @@ chmod 600 "$INSTALL_DIR/.env"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 log "installing systemd unit + helper scripts"
-install -m 0644 "$SCRIPT_DIR/polyvane.service"  /etc/systemd/system/$SERVICE_NAME.service
-install -m 0755 "$SCRIPT_DIR/healthcheck.sh"    /usr/local/bin/polyvane-healthcheck
-install -m 0644 "$SCRIPT_DIR/logrotate.conf"    /etc/logrotate.d/polyvane
+install -m 0644 "$SCRIPT_DIR/polyvane.service"      /etc/systemd/system/$SERVICE_NAME.service
+install -m 0644 "$SCRIPT_DIR/polyvane-api.service"  /etc/systemd/system/$API_SERVICE_NAME.service
+install -m 0755 "$SCRIPT_DIR/healthcheck.sh"        /usr/local/bin/polyvane-healthcheck
+install -m 0644 "$SCRIPT_DIR/logrotate.conf"        /etc/logrotate.d/polyvane
 
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME.service"
+systemctl enable "$API_SERVICE_NAME.service"
 
 # ---- 9. Healthcheck cron ----------------------------------------------------
 
@@ -239,6 +251,8 @@ Installation:
   install dir    $INSTALL_DIR
   venv           $INSTALL_DIR/venv
   service        $SERVICE_NAME.service (enabled, NOT started yet)
+  api service    $API_SERVICE_NAME.service (enabled, NOT started yet)
+  api port       $API_PORT/tcp (open in ufw)
   env file       $INSTALL_DIR/.env (chmod 600)
   log dir        $INSTALL_DIR/logs
   healthcheck    cron every 5 minutes -> polyvane-healthcheck
@@ -255,7 +269,13 @@ Next steps (from your local machine):
      or:
        make logs
 
-  3. When ready to flip to live trading:
+  3. Generate the dashboard API secret and start the API service:
+       a. python -c "import secrets; print(secrets.token_urlsafe(32))"
+       b. Paste the value as API_SECRET_KEY=... in $INSTALL_DIR/.env
+       c. sudo systemctl start $API_SERVICE_NAME
+       d. Verify:  curl http://<vps-ip>:$API_PORT/api/v1/ping
+
+  4. When ready to flip to live trading:
        a. Derive API creds locally with: PK=0x... python -m core.derive_creds
        b. Paste PK and creds into $INSTALL_DIR/.env on the VPS
        c. Run: make go-live

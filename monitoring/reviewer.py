@@ -262,14 +262,25 @@ class Reviewer:
         state: dict[str, Any],
     ) -> None:
         outcome_str = "won" if won else "lost"
-        meta = json.loads(trade.get("metadata_json") or "{}")
+        try:
+            meta = json.loads(trade.get("metadata_json") or "{}")
+        except json.JSONDecodeError:
+            # Malformed metadata in the journal (legacy rows where ±inf
+            # leaked in). Don't fail the resolution write — start fresh
+            # with just the resolution fields so future reads succeed.
+            log.warning(
+                "trade #%d has malformed metadata_json; resetting on resolution",
+                trade["id"],
+            )
+            meta = {}
         meta["resolved_yes_price"] = settled_price
         meta["resolved_at"] = datetime.now(timezone.utc).isoformat()
         meta["resolution_source"] = "gamma"
+        from core.logger import _sanitize_for_json
         with _connect(self.db_path) as conn:
             conn.execute(
                 "UPDATE trades SET outcome=?, pnl=?, metadata_json=? WHERE id=?",
-                (outcome_str, pnl, json.dumps(meta, default=str), trade["id"]),
+                (outcome_str, pnl, json.dumps(_sanitize_for_json(meta), default=str), trade["id"]),
             )
             conn.commit()
         log.info(
@@ -340,10 +351,28 @@ class Reviewer:
             (datetime.now(timezone.utc) - timedelta(days=since_days)).isoformat()
             if since_days else None
         )
+        # Filter by resolved_at for closed trades, by entry timestamp for
+        # pending ones — so a trade resolved in-window but entered earlier
+        # still contributes to the window's win_rate and PnL. The
+        # json_valid() guard is for malformed metadata_json (legacy rows
+        # with ±Infinity); without it json_extract raises and the entire
+        # SELECT fails.
         with _connect(self.db_path) as conn:
             if cutoff:
                 rows = [dict(r) for r in conn.execute(
-                    "SELECT * FROM trades WHERE timestamp >= ?", (cutoff,),
+                    """
+                    SELECT * FROM trades
+                    WHERE
+                      (outcome IN ('won','lost')
+                        AND COALESCE(
+                              CASE WHEN json_valid(metadata_json)
+                                   THEN json_extract(metadata_json, '$.resolved_at')
+                                   ELSE NULL END,
+                              timestamp
+                            ) >= ?)
+                      OR (outcome = 'pending' AND timestamp >= ?)
+                    """,
+                    (cutoff, cutoff),
                 ).fetchall()]
             else:
                 rows = [dict(r) for r in conn.execute("SELECT * FROM trades").fetchall()]

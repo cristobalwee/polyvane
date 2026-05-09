@@ -1,11 +1,18 @@
 .PHONY: help run run-live dashboard backtest calibrate add-city verify-sources test lint \
         deploy logs logs-trades logs-errors status restart go-live go-paper scan-now \
-        remote-dashboard derive-creds perf perf-7d perf-all remote-perf
+        remote-dashboard derive-creds perf perf-7d perf-all remote-perf \
+        report report-7d report-all remote-report \
+        repair-journal-dry repair-journal-apply remote-repair-journal \
+        api-run api-logs api-restart api-status
 
-PY ?= python
+# Prefer the project venv when present — Make's subshell doesn't inherit
+# the user's activated venv from their interactive shell, so falling back
+# to a bare `python3` would resolve to the system framework Python and
+# miss every project dep (aiohttp, yaml, etc.).
+PY ?= $(if $(wildcard .venv/bin/python3),.venv/bin/python3,python3)
 CONFIG ?= config/config.yaml
-START ?= $(shell python -c "from datetime import date, timedelta; print(date.today() - timedelta(days=30))")
-END ?= $(shell python -c "from datetime import date; print(date.today())")
+START ?= $(shell $(PY) -c "from datetime import date, timedelta; print(date.today() - timedelta(days=30))")
+END ?= $(shell $(PY) -c "from datetime import date; print(date.today())")
 
 # SSH target for the production VPS, e.g. POLYVANE_SSH=polyvane@1.2.3.4
 SSH ?= $(POLYVANE_SSH)
@@ -28,6 +35,12 @@ help:
 	@echo "  make perf            Per-strategy performance for today (UTC)"
 	@echo "  make perf-7d         Per-strategy performance for the last 7 days"
 	@echo "  make perf-all        Per-strategy lifetime performance"
+	@echo "  make report          Full report: lifetime + today, calibration, Brier, recent settled"
+	@echo "  make report-7d       Full report with 7d window"
+	@echo "  make report-all      Full report (window collapses to lifetime)"
+	@echo "  make repair-journal-dry   Dry-run scan of malformed metadata_json rows"
+	@echo "  make repair-journal-apply Repair malformed metadata_json rows (writes backup first)"
+	@echo "  make api-run         Run the FastAPI server locally on :8099"
 	@echo ""
 	@echo " remote (set POLYVANE_SSH=user@host)"
 	@echo "  make deploy          rsync code + restart systemd"
@@ -41,6 +54,11 @@ help:
 	@echo "  make scan-now        Trigger an immediate scan (restarts the service)"
 	@echo "  make remote-dashboard scp the journal DB and run dashboard locally"
 	@echo "  make remote-perf     scp the journal DB and run perf report locally"
+	@echo "  make remote-report   scp the journal DB and run the full report locally"
+	@echo "  make remote-repair-journal  Repair malformed metadata_json on the VPS journal"
+	@echo "  make api-logs        tail the API service logs"
+	@echo "  make api-restart     restart the API service"
+	@echo "  make api-status      check API service health"
 	@echo ""
 
 # ---- local --------------------------------------------------------------
@@ -94,6 +112,25 @@ perf-7d:
 
 perf-all:
 	$(PY) -m monitoring.perf_report --all
+
+# Full per-strategy report — lifetime + windowed, with calibration and Brier.
+# This is the "is the daily summary lying to me?" tool — run it any time.
+report:
+	$(PY) -m monitoring.report --since today
+
+report-7d:
+	$(PY) -m monitoring.report --since 7d
+
+# `--since 7d` is the widest window the CLI accepts; for "lifetime" the
+# windowed table will essentially equal lifetime once you've been running
+# longer than that. Use `make report-all` for an effectively-lifetime view.
+report-all:
+	$(PY) -m monitoring.report --since 36500d
+
+# Run the API locally. Reads .env for API_SECRET_KEY + DASHBOARD_ORIGINS.
+# `--reload` keeps it convenient for dashboard development.
+api-run:
+	$(PY) -m uvicorn api.server:app --host 127.0.0.1 --port 8099 --reload
 
 # ---- remote -------------------------------------------------------------
 
@@ -155,3 +192,47 @@ remote-perf: _check-ssh
 	@mkdir -p data
 	scp $(SSH):$(INSTALL_DIR)/data/trade_journal.db data/trade_journal.remote.db
 	$(PY) -m monitoring.perf_report --db data/trade_journal.remote.db --since $(PERF_SINCE)
+
+# Full report against a fresh copy of the production journal.
+# Override window with REPORT_SINCE=7d (default: today). Recent-trades
+# count is REPORT_RECENT (default: 30).
+REPORT_SINCE ?= today
+REPORT_RECENT ?= 30
+remote-report: _check-ssh
+	@mkdir -p data
+	scp $(SSH):$(INSTALL_DIR)/data/trade_journal.db data/trade_journal.remote.db
+	$(PY) -m monitoring.report \
+	    --db data/trade_journal.remote.db \
+	    --since $(REPORT_SINCE) \
+	    --recent $(REPORT_RECENT)
+
+# Repair malformed metadata_json rows (legacy ±Infinity from edge buckets).
+# `repair-journal-dry` reports without writing; `repair-journal-apply`
+# writes a backup alongside the DB and then fixes the rows.
+repair-journal-dry:
+	$(PY) -m scripts.repair_journal_metadata
+
+repair-journal-apply:
+	$(PY) -m scripts.repair_journal_metadata --apply
+
+# Repair the production journal in-place on the VPS. The script writes a
+# timestamped .bak.* sibling first, then applies the fix in a single
+# transaction, so a crash mid-write rolls back. Stop the bot first to
+# avoid contending with concurrent writes:
+#     make restart   # ... after verifying repair completed
+remote-repair-journal: _check-ssh
+	ssh $(SSH) "cd $(INSTALL_DIR) && \
+	    sudo -u polyvane $(INSTALL_DIR)/.venv/bin/python3 -m scripts.repair_journal_metadata --apply"
+
+# ---- API service (remote) ----------------------------------------------
+
+api-logs: _check-ssh
+	ssh -t $(SSH) "sudo journalctl -u polyvane-api -f -n 100"
+
+api-restart: _check-ssh
+	ssh -t $(SSH) "sudo systemctl restart polyvane-api && sleep 2 && systemctl --no-pager status polyvane-api | head -n 12"
+
+# Service health: systemd state + an unauthenticated /ping check from the
+# VPS itself (no API key needed for /ping).
+api-status: _check-ssh
+	ssh -t $(SSH) "systemctl --no-pager --full status polyvane-api | head -n 20 && echo --- && curl -sS -m 5 http://127.0.0.1:8099/api/v1/ping || echo 'ping failed'"

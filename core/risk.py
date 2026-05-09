@@ -130,9 +130,20 @@ def kelly_size(edge: float, price: float, bankroll_usd: float, fraction: float) 
 class RiskManager:
     """Pre-trade risk gate. Stateless w.r.t. fills — it queries the journal."""
 
-    def __init__(self, config: RiskConfig, journal: TradeJournal) -> None:
+    def __init__(
+        self,
+        config: RiskConfig,
+        journal: TradeJournal,
+        *,
+        is_paper: bool = False,
+    ) -> None:
         self.config = config
         self.journal = journal
+        # In paper mode the circuit breaker is fully disabled — there's no real
+        # money at stake, so halting trading just hides whatever went wrong
+        # from the post-hoc review (and prevents the strategies under evaluation
+        # from getting more samples). The breaker re-engages in live mode.
+        self._is_paper = bool(is_paper)
         self._lock = Lock()
         self._tripped: bool = False
         self._tripped_reason: str = ""
@@ -169,6 +180,8 @@ class RiskManager:
             self._drawdown_warned = False
 
     def is_halted(self) -> tuple[bool, str]:
+        if self._is_paper:
+            return False, ""
         with self._lock:
             self._maybe_roll_day()
             return self._tripped, self._tripped_reason
@@ -178,6 +191,8 @@ class RiskManager:
 
         Returns True if the breaker is currently tripped.
         """
+        if self._is_paper:
+            return False
         with self._lock:
             self._maybe_roll_day()
             realized = self.journal.realized_pnl_since(self._day_anchor)
@@ -258,8 +273,11 @@ class RiskManager:
         with self._lock:
             self._maybe_roll_day()
 
-            if self._tripped:
-                return TradeDecision(False, 0.0, f"circuit_breaker: {self._tripped_reason}")
+            # Circuit-breaker gates: skipped entirely in paper mode so we keep
+            # collecting trade samples even when a strategy is bleeding.
+            if not self._is_paper:
+                if self._tripped:
+                    return TradeDecision(False, 0.0, f"circuit_breaker: {self._tripped_reason}")
 
             if edge < self.config.min_edge_pct:
                 return TradeDecision(
@@ -267,14 +285,15 @@ class RiskManager:
                     f"edge {edge:.4f} below min_edge_pct {self.config.min_edge_pct}",
                 )
 
-            # Realized loss check (re-runs the breaker if just-tripped).
-            realized = self.journal.realized_pnl_since(self._day_anchor)
-            if realized <= -abs(self.config.max_daily_loss_usd):
-                self._tripped = True
-                self._tripped_reason = (
-                    f"Daily loss ${realized:.2f} <= -${self.config.max_daily_loss_usd:.2f}"
-                )
-                return TradeDecision(False, 0.0, f"circuit_breaker: {self._tripped_reason}")
+            # Realized loss check (re-runs the breaker if just-tripped). Live only.
+            if not self._is_paper:
+                realized = self.journal.realized_pnl_since(self._day_anchor)
+                if realized <= -abs(self.config.max_daily_loss_usd):
+                    self._tripped = True
+                    self._tripped_reason = (
+                        f"Daily loss ${realized:.2f} <= -${self.config.max_daily_loss_usd:.2f}"
+                    )
+                    return TradeDecision(False, 0.0, f"circuit_breaker: {self._tripped_reason}")
 
             # Daily entry-count cap.
             entries_today = self.journal.count_entries_since(self._day_anchor)
@@ -379,6 +398,9 @@ class RiskManager:
 
     def trip(self, reason: str) -> None:
         """Manually trip the circuit breaker (e.g., for fatal errors)."""
+        if self._is_paper:
+            log.warning("Risk: trip() ignored in paper mode (reason=%s)", reason)
+            return
         with self._lock:
             self._tripped = True
             self._tripped_reason = reason

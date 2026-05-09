@@ -13,13 +13,20 @@ Run:
 
 Output columns:
     Strategy        — strategy name
-    Trades          — entries opened in window
-    Open            — positions still pending resolution
+    Trades          — entries opened in window (filter: entry timestamp)
+    Open            — positions still pending resolution (lifetime — open
+                      positions always represent live exposure regardless of window)
     Exposure ($)    — sum(size_usd) for open positions
     Deployed ($)    — sum(size_usd) for trades opened in window
-    Realized ($)    — sum(pnl) for trades resolved in window
-    Win rate        — wins / (wins + losses) for resolved trades in window
+    Realized ($)    — sum(pnl) for trades RESOLVED in window (filter:
+                      metadata.resolved_at, falls back to entry timestamp)
+    Win rate        — wins / (wins + losses) for resolved-in-window trades
     Avg edge        — avg(edge_at_entry) over trades opened in window
+
+Why two filters: a trade entered yesterday and resolved today should count
+toward today's realized PnL but NOT today's "trades opened" — bucketing
+both on entry timestamp made resolved-but-stale trades invisible in the
+daily summary table.
 
 `--json` emits the same data as a JSON object (one key per strategy) for
 piping into other tools.
@@ -105,7 +112,15 @@ def _resolve_db_path(cli_db: str | None) -> Path:
 
 
 def collect(db_path: Path, *, since: datetime | None) -> list[StrategyStats]:
-    """Return per-strategy stats. `since=None` → lifetime."""
+    """Return per-strategy stats. `since=None` → lifetime.
+
+    Two filters are applied at different scopes:
+      * Entries (`trades`, `deployed_usd`, `avg_edge`) — by `timestamp`.
+      * Resolutions (`wins`, `losses`, `realized`) — by `resolved_at`
+        (from metadata_json), falling back to `timestamp` for legacy
+        rows that pre-date the field. This is what makes a trade
+        opened yesterday but resolved today count toward today's PnL.
+    """
     if not db_path.exists():
         raise SystemExit(f"trade journal not found at {db_path}")
 
@@ -118,35 +133,66 @@ def collect(db_path: Path, *, since: datetime | None) -> list[StrategyStats]:
         for row in conn.execute("SELECT DISTINCT strategy FROM trades"):
             by_strategy.setdefault(row["strategy"], StrategyStats(strategy=row["strategy"]))
 
-        # In-window aggregates (entries opened during [since, now]).
+        # Entries opened in window (timestamp filter).
         if since is None:
-            window_filter = ""
-            params: tuple = ()
+            entry_filter = ""
+            entry_params: tuple = ()
         else:
-            window_filter = "WHERE timestamp >= ?"
-            params = (since.isoformat(),)
+            entry_filter = "WHERE timestamp >= ?"
+            entry_params = (since.isoformat(),)
 
-        in_window = conn.execute(
+        entry_rows = conn.execute(
             f"""
             SELECT strategy,
                    COUNT(*) AS trades,
                    COALESCE(SUM(size_usd), 0.0) AS deployed_usd,
-                   COALESCE(AVG(edge_at_entry), 0.0) AS avg_edge,
-                   SUM(CASE outcome WHEN 'won'  THEN 1 ELSE 0 END) AS wins,
-                   SUM(CASE outcome WHEN 'lost' THEN 1 ELSE 0 END) AS losses,
-                   COALESCE(SUM(CASE outcome WHEN 'pending' THEN 0 ELSE pnl END), 0.0) AS realized
+                   COALESCE(AVG(edge_at_entry), 0.0) AS avg_edge
             FROM trades
-            {window_filter}
+            {entry_filter}
             GROUP BY strategy
             """,
-            params,
+            entry_params,
         ).fetchall()
-
-        for row in in_window:
+        for row in entry_rows:
             s = by_strategy.setdefault(row["strategy"], StrategyStats(strategy=row["strategy"]))
             s.trades = int(row["trades"] or 0)
             s.deployed_usd = float(row["deployed_usd"] or 0.0)
             s.avg_edge_at_entry = float(row["avg_edge"] or 0.0)
+
+        # Resolutions in window (resolved_at filter, with timestamp fallback).
+        # Lifetime mode skips the window predicate entirely.
+        if since is None:
+            res_filter = "WHERE outcome IN ('won','lost')"
+            res_params: tuple = ()
+        else:
+            # Guard json_extract with json_valid() — malformed metadata_json
+            # (e.g. legacy rows with ±Infinity from temperature edge buckets)
+            # would otherwise tear down the whole query.
+            res_filter = (
+                "WHERE outcome IN ('won','lost') "
+                "AND COALESCE("
+                "      CASE WHEN json_valid(metadata_json) "
+                "           THEN json_extract(metadata_json, '$.resolved_at') "
+                "           ELSE NULL END,"
+                "      timestamp"
+                "    ) >= ?"
+            )
+            res_params = (since.isoformat(),)
+
+        res_rows = conn.execute(
+            f"""
+            SELECT strategy,
+                   SUM(CASE outcome WHEN 'won'  THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE outcome WHEN 'lost' THEN 1 ELSE 0 END) AS losses,
+                   COALESCE(SUM(pnl), 0.0) AS realized
+            FROM trades
+            {res_filter}
+            GROUP BY strategy
+            """,
+            res_params,
+        ).fetchall()
+        for row in res_rows:
+            s = by_strategy.setdefault(row["strategy"], StrategyStats(strategy=row["strategy"]))
             s.wins = int(row["wins"] or 0)
             s.losses = int(row["losses"] or 0)
             s.realized_pnl_usd = float(row["realized"] or 0.0)

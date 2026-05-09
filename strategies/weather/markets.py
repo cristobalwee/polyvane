@@ -65,18 +65,52 @@ _MONTHS = {m: i for i, m in enumerate(
 
 
 # Aliases for city names as they appear in Polymarket event titles. Maps
-# raw spellings to a canonical resolution-registry city key.
+# raw spellings to a canonical resolution-registry city key. Keep order
+# stable: longer/more-specific aliases come first within a list because
+# `_normalize_city` does a substring check (e.g. so "los angeles" matches
+# before "san francisco" can mis-match a generic substring).
 _CITY_ALIASES: dict[str, list[str]] = {
-    "NYC":         ["nyc", "new york", "new york city"],
-    "London":      ["london"],
-    "Hong Kong":   ["hong kong", "hk"],
-    "Seoul":       ["seoul"],
-    "Shanghai":    ["shanghai"],
-    "Dallas":      ["dallas"],
-    "Atlanta":     ["atlanta"],
-    "Toronto":     ["toronto"],
-    "Ankara":      ["ankara"],
-    "Wellington":  ["wellington"],
+    "NYC":            ["nyc", "new york city", "new york"],
+    "London":         ["london"],
+    "Hong Kong":      ["hong kong", "hk"],
+    "Seoul":          ["seoul"],
+    "Shanghai":       ["shanghai"],
+    "Dallas":         ["dallas"],
+    "Atlanta":        ["atlanta"],
+    "Toronto":        ["toronto"],
+    "Ankara":         ["ankara"],
+    "Wellington":     ["wellington"],
+    # US additions
+    "Austin":         ["austin"],
+    "Chicago":        ["chicago"],
+    "Denver":         ["denver"],
+    "Houston":        ["houston"],
+    "Los Angeles":    ["los angeles", "la"],
+    "Miami":          ["miami"],
+    "San Francisco":  ["san francisco", "sf"],
+    "Seattle":        ["seattle"],
+    # International additions (unconfirmed sources — see resolution.py)
+    "Beijing":        ["beijing"],
+    "Tokyo":          ["tokyo"],
+    "Singapore":      ["singapore"],
+    "Mexico City":    ["mexico city"],
+    "Sao Paulo":      ["sao paulo", "são paulo"],
+    "Buenos Aires":   ["buenos aires"],
+    "Madrid":         ["madrid"],
+    "Paris":          ["paris"],
+    "Munich":         ["munich"],
+    "Amsterdam":      ["amsterdam"],
+    "Helsinki":       ["helsinki"],
+    "Tel Aviv":       ["tel aviv"],
+    "Istanbul":       ["istanbul"],
+    "Moscow":         ["moscow"],
+    "Warsaw":         ["warsaw"],
+    "Milan":          ["milan"],
+    "Cape Town":      ["cape town"],
+    "Manila":         ["manila"],
+    "Jakarta":        ["jakarta"],
+    "Taipei":         ["taipei"],
+    "Busan":          ["busan"],
 }
 
 

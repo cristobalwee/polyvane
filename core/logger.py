@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 import sys
 import threading
@@ -11,6 +12,25 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+
+
+def _sanitize_for_json(value: Any) -> Any:
+    """Recursively replace non-finite floats (Infinity/-Infinity/NaN) with None.
+
+    Python's `json.dumps` accepts these by default and emits the literals
+    `Infinity` / `-Infinity` / `NaN`, which are NOT valid in strict JSON.
+    SQLite's `json_extract` (used by perf reports and the reviewer) rejects
+    the entire column as malformed when it sees them. Weather strategies
+    emit ±inf for edge buckets ('<75°F', '>100°F'), so this triggers in
+    practice — see TemperatureBucket.low/high.
+    """
+    if isinstance(value, float):
+        return None if not math.isfinite(value) else value
+    if isinstance(value, dict):
+        return {k: _sanitize_for_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_for_json(v) for v in value]
+    return value
 
 
 _SCHEMA = """
@@ -93,7 +113,7 @@ class TradeJournal:
                     trade.edge_at_entry,
                     trade.outcome,
                     trade.pnl,
-                    json.dumps(trade.metadata, default=str),
+                    json.dumps(_sanitize_for_json(trade.metadata), default=str),
                 ),
             )
             return int(cur.lastrowid)
@@ -113,7 +133,7 @@ class TradeJournal:
                 merged.update(metadata)
                 conn.execute(
                     "UPDATE trades SET outcome = ?, pnl = ?, metadata_json = ? WHERE id = ?",
-                    (outcome, pnl, json.dumps(merged, default=str), trade_id),
+                    (outcome, pnl, json.dumps(_sanitize_for_json(merged), default=str), trade_id),
                 )
 
     def open_positions(self) -> list[dict[str, Any]]:
@@ -121,11 +141,58 @@ class TradeJournal:
             rows = conn.execute("SELECT * FROM trades WHERE outcome = 'pending'").fetchall()
             return [dict(r) for r in rows]
 
+    def closed_since(self, since_iso: str) -> list[dict[str, Any]]:
+        """Trades resolved on or after `since_iso`, ordered by resolution time.
+
+        Resolution time is `metadata.resolved_at` (set by the reviewer);
+        falls back to `timestamp` for any historical row that pre-dates that
+        field, or for rows whose metadata_json fails json_valid (legacy
+        rows where ±inf leaked in). Used by the daily summary to list
+        newly-settled trades.
+        """
+        # `json_extract` raises "malformed JSON" on invalid columns and
+        # tears down the whole query, so guard with json_valid().
+        resolved_at_expr = (
+            "COALESCE("
+            "  CASE WHEN json_valid(metadata_json) "
+            "       THEN json_extract(metadata_json, '$.resolved_at') "
+            "       ELSE NULL END,"
+            "  timestamp)"
+        )
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *, {resolved_at_expr} AS _resolved_at
+                FROM trades
+                WHERE outcome IN ('won','lost')
+                  AND {resolved_at_expr} >= ?
+                ORDER BY _resolved_at ASC
+                """,
+                (since_iso,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def realized_pnl_since(self, since_iso: str) -> float:
+        """Sum of pnl for trades RESOLVED on/after `since_iso`.
+
+        Resolution time is `metadata.resolved_at` (set by the reviewer when
+        it settles a trade); falls back to entry `timestamp` for any
+        historical row that pre-dates that field. Without this filter,
+        a trade entered yesterday and resolved today wouldn't count
+        toward today's realized PnL.
+        """
         with self._lock, self._connect() as conn:
             row = conn.execute(
-                "SELECT COALESCE(SUM(pnl), 0.0) AS total FROM trades "
-                "WHERE outcome IN ('won','lost') AND timestamp >= ?",
+                """
+                SELECT COALESCE(SUM(pnl), 0.0) AS total FROM trades
+                WHERE outcome IN ('won','lost')
+                  AND COALESCE(
+                        CASE WHEN json_valid(metadata_json)
+                             THEN json_extract(metadata_json, '$.resolved_at')
+                             ELSE NULL END,
+                        timestamp
+                      ) >= ?
+                """,
                 (since_iso,),
             ).fetchone()
             return float(row["total"])
