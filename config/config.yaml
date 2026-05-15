@@ -57,10 +57,14 @@ risk:
   dedup_open_positions: true
   dedup_open_positions_per_strategy:
     lazy: false
+    lazy_kalshi: false
 
 execution:
   # paper = log only, never submit. live = real orders. Default to paper.
+  # `mode` controls Polymarket. `kalshi_mode` controls Kalshi independently.
+  # If kalshi_mode is omitted it inherits from mode.
   mode: paper
+  kalshi_mode: paper
   # limit | market. Polymarket CLOB uses limit-style GTC orders by default.
   order_type: limit
   # If true, splits each entry into multiple tranches to reduce slippage/fill risk.
@@ -100,6 +104,16 @@ api:
   retry_max_attempts: 5
   retry_initial_delay_sec: 1.0
   retry_max_delay_sec: 30.0
+  # Kalshi API settings. When present, a KalshiClient is initialized
+  # alongside the Polymarket client and Kalshi strategy instances can trade.
+  # Auth env vars: KALSHI_KEY_ID + KALSHI_PRIVATE_KEY_PATH (live mode only).
+  kalshi:
+    demo_base_url: https://demo-api.kalshi.co/trade-api/v2
+    live_base_url: https://trading-api.kalshi.com/trade-api/v2
+    request_timeout_sec: 10
+    retry_max_attempts: 3
+    retry_initial_delay_sec: 1.0
+    retry_max_delay_sec: 30.0
 
 monitoring:
   dashboard_refresh_sec: 30
@@ -117,6 +131,9 @@ monitoring:
     weekly_review_day: sunday
     bias_flag_threshold_pct: 0.02
     mismatch_std_dev_multiple: 2.0
+    # Kalshi REST base URL for resolution polling (public endpoint, no auth).
+    # Switch to live_base_url when kalshi_mode=live.
+    kalshi_base_url: "https://demo-api.kalshi.co/trade-api/v2"
   health:
     # Minimum pUSD wallet balance before trading is paused (live mode).
     min_wallet_balance_usd: 20.0
@@ -140,6 +157,8 @@ paper_bankroll_usd: 1000.0
 paper_bankroll_per_strategy:
   weather: 1000.0
   lazy:    1000.0
+  weather_kalshi: 1000.0
+  lazy_kalshi:    1000.0
 
 # Reusable city list. YAML anchors keep the three weather variants in sync
 # without duplicating the list.
@@ -238,6 +257,55 @@ strategies:
       max_forecast_horizon_hours: 48
       scan_interval_sec: 90
       min_liquidity_usd: 100.0
+
+  # ---- Kalshi strategies (same logic, different exchange) --------------
+  # These mirror the Polymarket strategies above but scan and trade on
+  # Kalshi's binary temperature markets instead of Polymarket's buckets.
+  # Enable once KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PATH are configured.
+  # Kalshi binary markets: each market is "Will HIGH temp be >= X°F?"
+  # Lazy strategy: identical threshold logic (buy YES when price >= 0.60).
+  - name: lazy
+    enabled: true
+    params:
+      exchange: kalshi
+      thresholds: [0.60, 0.75]
+      claimed_edge_pct: 0.10
+      max_price: 0.95
+      min_hours_to_resolution: 12
+      max_forecast_horizon_hours: 48
+      scan_interval_sec: 90
+      min_liquidity_usd: 0       # Kalshi doesn't expose USD liquidity per-market
+
+  # Weather strategy: uses forecast CDF (P(temp >= threshold)) vs Kalshi
+  # YES price for edge; same ensemble models and bias corrections as above.
+  - name: weather
+    enabled: true
+    params:
+      exchange: kalshi
+      cities: [Atlanta, NYC, Chicago, Dallas, Houston, Miami]
+      require_confirmed_resolution: false  # Kalshi has its own resolution registry
+      forecast_models: [noaa, open_meteo_gfs, open_meteo_icon]
+      forecast_model_weights:
+        open_meteo_gfs: 0.366
+        noaa: 0.326
+        open_meteo_icon: 0.308
+      per_source_std_dev_f:
+        noaa: 2.22
+        open_meteo_gfs: 2.10
+        open_meteo_icon: 2.28
+      per_city_bias_f:
+        Chicago:        2.10
+        Dallas:         2.02
+        NYC:           -0.88
+        Miami:          0.69
+      min_bias_apply_f: 0.5
+      min_agreement: 0.0
+      min_edge_pct: 0.15
+      max_edge_sanity: 0.30
+      min_hours_to_resolution: 12
+      max_forecast_horizon_hours: 48
+      scan_interval_sec: 300
+      noaa_max_rps: 5.0
 
   # ---- Other strategies (still scaffolds — disabled) -------------------
   - name: arbitrage

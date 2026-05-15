@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS trades (
     edge_at_entry   REAL    NOT NULL,
     outcome         TEXT    NOT NULL DEFAULT 'pending',
     pnl             REAL,
-    metadata_json   TEXT    NOT NULL DEFAULT '{}'
+    metadata_json   TEXT    NOT NULL DEFAULT '{}',
+    exchange        TEXT    NOT NULL DEFAULT 'polymarket'
 );
 CREATE INDEX IF NOT EXISTS idx_trades_strategy   ON trades(strategy);
 CREATE INDEX IF NOT EXISTS idx_trades_outcome    ON trades(outcome);
@@ -70,6 +71,7 @@ class TradeRecord:
     pnl: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    exchange: str = "polymarket"
 
 
 class TradeJournal:
@@ -81,6 +83,17 @@ class TradeJournal:
         self._lock = threading.Lock()
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            conn.commit()
+            try:
+                conn.execute(
+                    "ALTER TABLE trades ADD COLUMN exchange TEXT NOT NULL DEFAULT 'polymarket'"
+                )
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trades_exchange ON trades(exchange)"
+            )
             conn.commit()
 
     @contextmanager
@@ -98,8 +111,9 @@ class TradeJournal:
                 """
                 INSERT INTO trades (
                     timestamp, strategy, market_id, market_question, direction,
-                    entry_price, size_usd, shares, edge_at_entry, outcome, pnl, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    entry_price, size_usd, shares, edge_at_entry, outcome, pnl, metadata_json,
+                    exchange
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     trade.timestamp,
@@ -114,6 +128,7 @@ class TradeJournal:
                     trade.outcome,
                     trade.pnl,
                     json.dumps(_sanitize_for_json(trade.metadata), default=str),
+                    trade.exchange,
                 ),
             )
             return int(cur.lastrowid)

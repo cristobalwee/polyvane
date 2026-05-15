@@ -218,6 +218,29 @@ class EnsembleForecaster:
             bias_applied_f=bias_f,
         )
 
+    def cdf_exceedance(
+        self,
+        forecasts: Sequence[Forecast],
+        threshold_f: float,
+        *,
+        city: str | None = None,
+    ) -> float:
+        """P(temp >= threshold_f) under the weighted Gaussian mixture.
+
+        Used for Kalshi binary threshold markets ("Will HIGH temp be >= X°F?")
+        instead of bucket probabilities. Applies the same per-city bias
+        correction as `build()`.
+        """
+        bias_f = self.bias_for_city(city)
+        members = self._members_in_canonical_unit(forecasts, bias_f=bias_f)
+        if not members:
+            return 0.0
+        p = sum(
+            m.weight * (1.0 - _norm_cdf((threshold_f - m.mean_f) / max(m.std_f, 1e-9)))
+            for m in members
+        )
+        return max(0.0, min(1.0, p))
+
     def _members_in_canonical_unit(
         self,
         forecasts: Sequence[Forecast],

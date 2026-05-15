@@ -104,8 +104,12 @@ def load_strategies(
             log.warning("Strategy module %s has no BaseStrategy subclass — skipping", module_path)
             continue
         instance = cls(params=entry.get("params") or {}, context=context)
+        exchange = (entry.get("params") or {}).get("exchange", "polymarket")
+        if exchange != "polymarket":
+            instance_name = f"{name}_{exchange}"
+            instance._instance_name = instance_name  # type: ignore[attr-defined]
         strategies.append(instance)
-        log.info("Loaded strategy: %s", name)
+        log.info("Loaded strategy: %s", getattr(instance, "_instance_name", name))
     return strategies
 
 
@@ -116,14 +120,18 @@ def _print_startup_banner(
     cities: list[str],
     strategies: list[str],
     config_path: Path,
+    kalshi_mode: str | None = None,
 ) -> None:
     cities_str = ", ".join(cities) if cities else "(none)"
     strategies_str = ", ".join(strategies) if strategies else "(none enabled)"
+    exchange_lines = [f"  Polymarket CLOB V2  [{mode.upper()}]"]
+    if kalshi_mode is not None:
+        exchange_lines.append(f"  Kalshi REST v2      [{kalshi_mode.upper()}]")
     banner = [
         "========================================",
         f"PolyVane v{VERSION}",
-        f"Mode: {mode.upper()}",
-        "Exchange: Polymarket CLOB V2",
+        "Exchanges:",
+        *exchange_lines,
         f"Strategies: {strategies_str}",
         f"Cities: {cities_str}",
         f"Config: {config_path}",
@@ -140,6 +148,15 @@ def _resolve_trading_mode(cfg: dict[str, Any]) -> str:
         return env
     cfg_mode = str(cfg["execution"].get("mode", "paper")).lower()
     return cfg_mode if cfg_mode in ("paper", "live") else "paper"
+
+
+def _resolve_kalshi_mode(cfg: dict[str, Any], polymarket_mode: str) -> str:
+    """Resolve Kalshi trading mode. KALSHI_MODE env var beats config.execution.kalshi_mode."""
+    env = (os.environ.get("KALSHI_MODE") or "").strip().lower()
+    if env in ("paper", "live"):
+        return env
+    cfg_mode = str(cfg["execution"].get("kalshi_mode") or polymarket_mode).lower()
+    return cfg_mode if cfg_mode in ("paper", "live") else polymarket_mode
 
 
 async def heartbeat_loop(
@@ -245,7 +262,8 @@ async def strategy_loop(
                     if intent is None:
                         continue
                     try:
-                        bankroll = await bankroll_provider(strategy.name)
+                        instance_name = getattr(strategy, "_instance_name", strategy.name)
+                        bankroll = await bankroll_provider(instance_name)
                         await executor.submit(intent, bankroll_usd=bankroll)
                     except Exception:
                         log.exception("Executor submit failed for strategy %s", strategy.name)
@@ -309,7 +327,7 @@ async def daily_summary_loop(
     alerts: AlertBus,
     alert_cfg: AlertConfig,
     reviewer: Reviewer,
-    client: ClobClient,
+    clients: dict[str, Any],
     interval_sec: float,
     stop_event: asyncio.Event,
     log: logging.Logger,
@@ -367,7 +385,7 @@ async def daily_summary_loop(
                     log.exception("monitoring.report view collection failed in daily summary")
 
                 per_strategy_positions = await _build_open_positions_by_strategy(
-                    open_rows, client, log,
+                    open_rows, clients, log,
                 )
 
                 alerts.emit("daily_summary", {
@@ -419,19 +437,21 @@ def _group_resolutions_by_strategy(
 
 async def _build_open_positions_by_strategy(
     open_rows: list[dict[str, Any]],
-    client: ClobClient,
+    clients: dict[str, Any],
     log: logging.Logger,
 ) -> dict[str, list[dict[str, Any]]]:
     """Group open positions by strategy, parsing metadata_json and attaching
     a current mark price (best-effort midpoint per token_id)."""
     parsed: list[dict[str, Any]] = []
-    token_ids: list[str] = []
+    # (token_id, exchange) pairs for midpoint fetching
+    token_pairs: list[tuple[str, str]] = []
     for r in open_rows:
         try:
             meta = json.loads(r.get("metadata_json") or "{}")
         except (json.JSONDecodeError, TypeError):
             meta = {}
         token_id = meta.get("token_id") or ""
+        exchange = r.get("exchange") or meta.get("exchange") or "polymarket"
         parsed.append({
             "trade_id": r.get("id"),
             "strategy": r.get("strategy"),
@@ -442,39 +462,44 @@ async def _build_open_positions_by_strategy(
             "shares": r.get("shares"),
             "metadata": meta,
             "token_id": token_id,
+            "exchange": exchange,
             "mark_price": None,
         })
         if token_id:
-            token_ids.append(token_id)
+            token_pairs.append((token_id, exchange))
 
-    # Fetch midpoints for unique token_ids in parallel. Best-effort —
-    # any failure leaves mark_price=None and the formatter renders "—".
-    unique_tokens = sorted(set(token_ids))
-    marks: dict[str, float] = {}
-    if unique_tokens and client.is_initialized:
-        async def _fetch(tid: str) -> tuple[str, float | None]:
+    # Fetch midpoints for unique (token_id, exchange) pairs in parallel.
+    # Best-effort — any failure leaves mark_price=None and the formatter renders "—".
+    unique_pairs = sorted(set(token_pairs))
+    marks: dict[tuple[str, str], float] = {}
+    if unique_pairs:
+        async def _fetch(tid: str, exch: str) -> tuple[tuple[str, str], float | None]:
+            cl = clients.get(exch, clients.get("polymarket"))
+            if cl is None or not getattr(cl, "is_initialized", False):
+                return (tid, exch), None
             try:
-                resp = await asyncio.wait_for(client.get_midpoint(tid), timeout=5.0)
+                resp = await asyncio.wait_for(cl.get_midpoint(tid), timeout=5.0)
                 mid = resp.get("mid") if isinstance(resp, dict) else resp
-                return tid, float(mid) if mid is not None else None
+                return (tid, exch), float(mid) if mid is not None else None
             except Exception:
-                return tid, None
+                return (tid, exch), None
         results = await asyncio.gather(
-            *(_fetch(tid) for tid in unique_tokens), return_exceptions=False,
+            *(_fetch(tid, exch) for tid, exch in unique_pairs), return_exceptions=False,
         )
-        for tid, mid in results:
+        for key, mid in results:
             if mid is not None:
-                marks[tid] = mid
-        if len(marks) < len(unique_tokens):
+                marks[key] = mid
+        if len(marks) < len(unique_pairs):
             log.info(
                 "daily_summary: fetched marks for %d/%d open token_ids",
-                len(marks), len(unique_tokens),
+                len(marks), len(unique_pairs),
             )
 
     grouped: dict[str, list[dict[str, Any]]] = {}
     for p in parsed:
-        if p["token_id"] in marks:
-            p["mark_price"] = marks[p["token_id"]]
+        key = (p["token_id"], p["exchange"])
+        if key in marks:
+            p["mark_price"] = marks[key]
         grouped.setdefault(p["strategy"] or "unknown", []).append(p)
     return grouped
 
@@ -541,6 +566,68 @@ async def run(config_path: Path) -> int:
             api_passphrase=api_pass,
         )
 
+    # Kalshi client initialization (independent of Polymarket mode).
+    kalshi_mode = _resolve_kalshi_mode(cfg, mode)
+    cfg["execution"]["kalshi_mode"] = kalshi_mode
+
+    kalshi_client = None
+    kalshi_cfg_raw = cfg["api"].get("kalshi") or {}
+    if kalshi_cfg_raw:
+        from core.kalshi_client import KalshiClient, KalshiClientConfig  # noqa: PLC0415
+        kalshi_client_cfg = KalshiClientConfig.from_dict({
+            **kalshi_cfg_raw,
+            "key_id": os.getenv("KALSHI_KEY_ID", ""),
+            "private_key_path": os.getenv("KALSHI_PRIVATE_KEY_PATH", ""),
+            "base_url": (
+                kalshi_cfg_raw.get("demo_base_url", "https://demo-api.kalshi.co/trade-api/v2")
+                if kalshi_mode == "paper"
+                else kalshi_cfg_raw.get("live_base_url", "https://trading-api.kalshi.com/trade-api/v2")
+            ),
+        })
+        kalshi_client = KalshiClient(kalshi_client_cfg)
+        _kalshi_key_id = os.getenv("KALSHI_KEY_ID", "")
+        _kalshi_key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "")
+        _kalshi_has_creds = bool(_kalshi_key_id and _kalshi_key_path)
+
+        if kalshi_mode == "live":
+            if not _kalshi_has_creds:
+                log.error(
+                    "FATAL | Kalshi live mode requires KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PATH."
+                )
+                return 2
+            if not LIVE_TRADING_SAFETY_FILE.exists():
+                log.error(
+                    "FATAL | Cannot start Kalshi in LIVE mode — safety file missing. "
+                    "Run: touch %s",
+                    LIVE_TRADING_SAFETY_FILE,
+                )
+                return 3
+            kalshi_client.initialize_authenticated()
+            log.warning("Kalshi MODE: LIVE — orders will be submitted to Kalshi.")
+        elif _kalshi_has_creds:
+            # Paper mode but credentials present: authenticate so market-data
+            # reads succeed (Kalshi requires auth on all endpoints, including
+            # GET /markets). Orders are still suppressed by is_paper_for().
+            kalshi_client.initialize_authenticated()
+            log.warning(
+                "Kalshi MODE: paper — authenticated for market data, orders will NOT be submitted."
+            )
+        else:
+            # No credentials at all: scanner will return empty lists and
+            # Kalshi strategies will idle without error.
+            kalshi_client.initialize_unauthenticated()
+            log.warning(
+                "Kalshi MODE: paper (no credentials) — "
+                "set KALSHI_KEY_ID + KALSHI_PRIVATE_KEY_PATH to enable market scans."
+            )
+
+    clients: dict[str, Any] = {"polymarket": client}
+    if kalshi_client is not None:
+        clients["kalshi"] = kalshi_client
+
+    # Rebuild exec_cfg now that kalshi_mode is resolved so is_paper_for() is correct.
+    exec_cfg = ExecutionConfig.from_dict(cfg["execution"])
+
     # Banner — printed AFTER initialization so the mode line reflects reality.
     enabled_strategy_names = [s["name"] for s in cfg.get("strategies", []) if s.get("enabled")]
     weather_cfg = next(
@@ -554,9 +641,10 @@ async def run(config_path: Path) -> int:
         cities=cities,
         strategies=enabled_strategy_names,
         config_path=config_path,
+        kalshi_mode=kalshi_mode if kalshi_client is not None else None,
     )
 
-    executor = Executor(exec_cfg, risk, journal, client)
+    executor = Executor(exec_cfg, risk, journal, client, clients=clients)
 
     stop_loss_pct = float(cfg["risk"].get("stop_loss_pct", 0.50))
     stop_loss = StopLossManager(
@@ -564,6 +652,8 @@ async def run(config_path: Path) -> int:
         client=client,
         is_paper=exec_cfg.is_paper,
         stop_loss_pct=stop_loss_pct,
+        clients=clients,
+        exec_config=exec_cfg,
     )
 
     monitoring_cfg = cfg.get("monitoring") or {}
@@ -591,7 +681,16 @@ async def run(config_path: Path) -> int:
         is_paper_mode=exec_cfg.is_paper,
     )
 
-    reviewer_cfg = ReviewerConfig.from_dict(monitoring_cfg.get("review"))
+    review_dict = dict(monitoring_cfg.get("review") or {})
+    if kalshi_client is not None:
+        review_dict.setdefault(
+            "kalshi_base_url",
+            kalshi_cfg_raw.get(
+                "demo_base_url" if kalshi_mode == "paper" else "live_base_url",
+                "https://demo-api.kalshi.co/trade-api/v2",
+            ),
+        )
+    reviewer_cfg = ReviewerConfig.from_dict(review_dict)
     reviewer = Reviewer(reviewer_cfg, journal.db_path, alert_hook=alerts.emit)
 
     risk.set_alert_hook(alerts.emit)
@@ -600,7 +699,7 @@ async def run(config_path: Path) -> int:
 
     market_cache_ttl = float(cfg.get("market_cache", {}).get("default_ttl_sec", 30.0))
     market_cache = MarketCache(default_ttl_sec=market_cache_ttl)
-    context = StrategyContext(client=client, config=cfg, market_cache=market_cache, journal=journal)
+    context = StrategyContext(client=client, config=cfg, market_cache=market_cache, journal=journal, clients=clients)
     strategies = load_strategies(cfg, context, log)
     for s in strategies:
         if hasattr(s, "set_alert_hook"):
@@ -683,7 +782,7 @@ async def run(config_path: Path) -> int:
                 alerts=alerts,
                 alert_cfg=alert_cfg,
                 reviewer=reviewer,
-                client=client,
+                clients=clients,
                 interval_sec=60.0,
                 stop_event=stop_event,
                 log=log,
@@ -726,6 +825,9 @@ async def run(config_path: Path) -> int:
     await reviewer.stop()
     await health.stop()
     await alerts.stop()
+
+    if kalshi_client is not None:
+        await kalshi_client.close()
 
     log.info("Shutdown complete.")
     return 0

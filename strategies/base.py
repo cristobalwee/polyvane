@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 
 log = logging.getLogger(__name__)
@@ -35,6 +35,7 @@ class Signal:
     category: str | None = None      # used by per-category exposure cap
     token_id: str | None = None      # CLOB token id, if known
     metadata: dict[str, Any] = field(default_factory=dict)
+    exchange: str = "polymarket"     # exchange this signal originates from
 
     def __post_init__(self) -> None:
         if self.direction not in ("YES", "NO"):
@@ -100,8 +101,19 @@ class StrategyContext:
     so a bot restart doesn't re-fire rungs that already have open trades).
     Strategies must NEVER write to the journal directly; the executor owns
     that path.
+
+    Multi-exchange: `clients` maps exchange name → client instance. Use
+    `get_client(exchange)` instead of accessing `client` directly.
+    `client` is kept for backward compatibility.
     """
-    client: Any              # core.client.ClobClient
+    client: Any              # core.client.ClobClient (polymarket)
     config: dict[str, Any]   # full parsed config (read-only)
     market_cache: Any = None  # core.market_cache.MarketCache | None
     journal: Any = None       # core.logger.TradeJournal | None — read-only use
+    clients: dict[str, Any] = field(default_factory=dict)  # exchange → client
+
+    def get_client(self, exchange: str = "polymarket") -> Any:
+        """Return the client for `exchange`, falling back to self.client."""
+        if self.clients:
+            return self.clients.get(exchange, self.client)
+        return self.client

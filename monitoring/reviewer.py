@@ -68,6 +68,7 @@ class ReviewerConfig:
     weekly_review_day: str = "sunday"        # weekday name, lowercase
     bias_flag_threshold_pct: float = 0.02    # 2% absolute realized vs predicted gap
     mismatch_std_dev_multiple: float = 2.0
+    kalshi_base_url: str = "https://demo-api.kalshi.co/trade-api/v2"
 
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None) -> "ReviewerConfig":
@@ -77,6 +78,9 @@ class ReviewerConfig:
             weekly_review_day=str(d.get("weekly_review_day") or "sunday").lower(),
             bias_flag_threshold_pct=float(d.get("bias_flag_threshold_pct", 0.02)),
             mismatch_std_dev_multiple=float(d.get("mismatch_std_dev_multiple", 2.0)),
+            kalshi_base_url=str(
+                d.get("kalshi_base_url") or "https://demo-api.kalshi.co/trade-api/v2"
+            ),
         )
 
 
@@ -153,7 +157,8 @@ class Reviewer:
     async def check_resolutions(self) -> int:
         """Settle any pending trades whose markets have closed.
 
-        Returns the number of trades closed this pass.
+        Routes Polymarket trades to Gamma API and Kalshi trades to
+        Kalshi REST API. Returns the number of trades closed this pass.
         """
         with _connect(self.db_path) as conn:
             pending = [dict(r) for r in conn.execute(
@@ -162,6 +167,26 @@ class Reviewer:
         if not pending:
             return 0
 
+        polymarket_pending = [
+            p for p in pending
+            if (p.get("exchange") or "polymarket") == "polymarket"
+        ]
+        kalshi_pending = [
+            p for p in pending
+            if (p.get("exchange") or "polymarket") == "kalshi"
+        ]
+
+        closed = 0
+        closed += await self._check_polymarket_resolutions(polymarket_pending)
+        closed += await self._check_kalshi_resolutions(kalshi_pending)
+
+        if closed:
+            log.info("Reviewer: closed %d trade(s) this pass", closed)
+        return closed
+
+    async def _check_polymarket_resolutions(self, pending: list[dict[str, Any]]) -> int:
+        if not pending:
+            return 0
         # De-dup by market_id so we hit the API once per unique market.
         unique_market_ids = sorted({p["market_id"] for p in pending})
         market_states: dict[str, dict[str, Any]] = {}
@@ -183,10 +208,85 @@ class Reviewer:
             self._record_resolution(trade, won, pnl, settled_price, state)
             self._maybe_flag_mismatch(trade, state)
             closed += 1
-
-        if closed:
-            log.info("Reviewer: closed %d trade(s) this pass", closed)
         return closed
+
+    async def _check_kalshi_resolutions(self, pending: list[dict[str, Any]]) -> int:
+        """Check Kalshi pending trades for resolution via Kalshi REST API.
+
+        Market status is public (no auth required). Falls back gracefully if
+        the session is unavailable or the API is unreachable.
+        """
+        if not pending:
+            return 0
+        if self._session is None:
+            log.warning(
+                "Reviewer: %d Kalshi trade(s) pending but no HTTP session — skipping",
+                len(pending),
+            )
+            return 0
+
+        unique_tickers = sorted({p["market_id"] for p in pending})
+        market_states: dict[str, dict[str, Any]] = {}
+        for ticker in unique_tickers:
+            state = await self._fetch_kalshi_market_state(ticker)
+            if state is not None:
+                market_states[ticker] = state
+
+        closed = 0
+        for trade in pending:
+            state = market_states.get(trade["market_id"])
+            if state is None:
+                continue
+            outcome = self._infer_kalshi_outcome(trade, state)
+            if outcome is None:
+                continue
+            won, settled_price = outcome
+            pnl = self._compute_pnl(trade, won, settled_price)
+            self._record_resolution(trade, won, pnl, settled_price, state)
+            closed += 1
+        return closed
+
+    async def _fetch_kalshi_market_state(self, ticker: str) -> dict[str, Any] | None:
+        """Fetch Kalshi market state (no auth required for market data)."""
+        assert self._session is not None
+        url = f"{self.config.kalshi_base_url}/markets/{ticker}"
+        try:
+            async with self._session.get(
+                url, timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status >= 400:
+                    log.debug("Kalshi market fetch HTTP %d for %s", resp.status, ticker)
+                    return None
+                data = await resp.json(content_type=None)
+                # Kalshi wraps the market in a "market" key
+                if isinstance(data, dict):
+                    return data.get("market") or data
+                return None
+        except aiohttp.ClientError as exc:
+            log.debug("Kalshi market fetch failed for %s: %s", ticker, exc)
+            return None
+
+    @staticmethod
+    def _infer_kalshi_outcome(
+        trade: dict[str, Any], state: dict[str, Any]
+    ) -> tuple[bool, float] | None:
+        """Return (won, settled_yes_price) or None if not yet finalized.
+
+        Kalshi markets resolve with status="finalized" and result="yes"|"no".
+        """
+        if str(state.get("status") or "").lower() != "finalized":
+            return None
+        result = str(state.get("result") or "").lower()
+        if result not in ("yes", "no"):
+            return None
+        yes_won = result == "yes"
+        settled_price = 1.0 if yes_won else 0.0
+        direction = trade.get("direction", "YES")
+        if direction == "YES":
+            won = yes_won
+        else:
+            won = not yes_won
+        return won, settled_price
 
     async def _fetch_market_state(self, market_id: str) -> dict[str, Any] | None:
         assert self._session is not None

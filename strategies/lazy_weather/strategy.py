@@ -38,6 +38,8 @@ class LazyWeatherStrategy(BaseStrategy):
 
     def __init__(self, params: dict[str, Any], context: StrategyContext) -> None:
         super().__init__(params, context)
+        # Exchange this instance trades on. Defaults to Polymarket.
+        self._exchange: str = str(params.get("exchange") or "polymarket").lower()
         # Ladder thresholds: entry floor first, then pyramid levels. Each fires
         # at most once per (market_id, bucket_label). `price_threshold` is kept
         # as a back-compat alias for a single-rung ladder.
@@ -56,8 +58,10 @@ class LazyWeatherStrategy(BaseStrategy):
 
         self._session: aiohttp.ClientSession | None = None
         self._scanner: LazyGammaScanner | None = None
+        self._kalshi_scanner: Any | None = None
         self._last_scan_at: datetime | None = None
         # Per-bucket ladder state: which thresholds have already fired.
+        # Key: (market_id, bucket_label) where bucket_label="" for Kalshi binary markets.
         # Survives across scans so a bucket bouncing between $0.59 and $0.61
         # only triggers the $0.60 buy once. Does NOT survive bot restarts —
         # the journal-side dedup catches that.
@@ -65,15 +69,29 @@ class LazyWeatherStrategy(BaseStrategy):
 
     async def setup(self) -> None:
         self._session = aiohttp.ClientSession()
-        self._scanner = LazyGammaScanner(
-            self._session,
-            request_timeout_sec=self._request_timeout_sec,
-        )
+        if self._exchange == "kalshi":
+            from strategies.weather.kalshi_markets import KalshiMarketScanner
+            kalshi_client = self.context.get_client("kalshi")
+            if kalshi_client is None:
+                self.log.warning(
+                    "LazyWeatherStrategy (Kalshi): no Kalshi client in context — scans will return empty"
+                )
+            self._kalshi_scanner = KalshiMarketScanner(
+                kalshi_client,
+                request_timeout_sec=self._request_timeout_sec,
+            ) if kalshi_client else None
+            self._scanner = None
+        else:
+            self._scanner = LazyGammaScanner(
+                self._session,
+                request_timeout_sec=self._request_timeout_sec,
+            )
+            self._kalshi_scanner = None
         self._hydrate_fired_from_journal()
         ladder = ", ".join(f"${t:.2f}" for t in self._thresholds)
         self.log.info(
-            "LazyWeatherStrategy ready: ladder=[%s] claimed_edge=%.2f window=%.0f-%.0fh min_liq=$%.0f",
-            ladder, self._claimed_edge,
+            "LazyWeatherStrategy ready: exchange=%s ladder=[%s] claimed_edge=%.2f window=%.0f-%.0fh min_liq=$%.0f",
+            self._exchange, ladder, self._claimed_edge,
             self._min_hours, self._max_hours, self._min_liquidity,
         )
 
@@ -86,6 +104,9 @@ class LazyWeatherStrategy(BaseStrategy):
         is the only thing preventing duplicate rung buys after restart.
         Rows missing `metadata.ladder_threshold` are skipped — they
         pre-date the ladder rollout and shouldn't seed the map.
+
+        Filters by exchange so Polymarket and Kalshi instances don't
+        seed each other's _fired sets.
         """
         journal = getattr(self.context, "journal", None)
         if journal is None:
@@ -104,17 +125,22 @@ class LazyWeatherStrategy(BaseStrategy):
                 meta = json.loads(row.get("metadata_json") or "{}")
             except (TypeError, ValueError):
                 continue
-            bucket = meta.get("bucket")
+            # Filter by exchange — don't cross-contaminate.
+            row_exchange = row.get("exchange") or meta.get("exchange") or "polymarket"
+            if row_exchange != self._exchange:
+                continue
+            # For Kalshi binary markets, bucket may be absent; use "" as placeholder.
+            bucket = meta.get("bucket") or ""
             threshold = meta.get("ladder_threshold")
-            if bucket is None or threshold is None:
+            if threshold is None:
                 continue
             key = (str(row.get("market_id")), str(bucket))
             self._fired.setdefault(key, set()).add(float(threshold))
             seeded_rungs += 1
         if seeded_rungs:
             self.log.info(
-                "lazy: hydrated _fired from journal — %d open rungs across %d buckets",
-                seeded_rungs, len(self._fired),
+                "lazy[%s]: hydrated _fired from journal — %d open rungs across %d buckets",
+                self._exchange, seeded_rungs, len(self._fired),
             )
 
     async def teardown(self) -> None:
@@ -125,6 +151,11 @@ class LazyWeatherStrategy(BaseStrategy):
     async def scan(self) -> list[Signal]:
         if not self._should_scan_now():
             return []
+        if self._exchange == "kalshi":
+            return await self._scan_kalshi()
+        return await self._scan_polymarket()
+
+    async def _scan_polymarket(self) -> list[Signal]:
         assert self._scanner is not None
         markets = await self._scanner.fetch_active()
         self._last_scan_at = datetime.now(timezone.utc)
@@ -172,12 +203,97 @@ class LazyWeatherStrategy(BaseStrategy):
         self._fired = {k: v for k, v in self._fired.items() if k in live_keys}
 
         self.log.info(
-            "lazy scan: %d markets total | %d candidate signals | "
+            "lazy[polymarket] scan: %d markets total | %d candidate signals | "
             "skipped: window=%d below_floor=%d max_price=%d liq=%d already_fired=%d",
             len(markets), candidates, skipped_window, skipped_below_floor,
             skipped_max_price, skipped_liq, skipped_already_fired,
         )
         return signals
+
+    async def _scan_kalshi(self) -> list[Signal]:
+        if self._kalshi_scanner is None:
+            return []
+        markets = await self._kalshi_scanner.fetch_active_weather()
+        self._last_scan_at = datetime.now(timezone.utc)
+        if not markets:
+            return []
+
+        now = datetime.now(timezone.utc)
+        signals: list[Signal] = []
+        candidates = 0
+        skipped_window = 0
+        skipped_below_floor = 0
+        skipped_max_price = 0
+        skipped_already_fired = 0
+
+        floor = self._thresholds[0]
+        for m in markets:
+            hours_to_end = (m.end_date_utc - now).total_seconds() / 3600.0
+            if hours_to_end < self._min_hours or hours_to_end > self._max_hours:
+                skipped_window += 1
+                continue
+            if m.yes_price > self._max_price:
+                skipped_max_price += 1
+                continue
+            if m.yes_price < floor:
+                skipped_below_floor += 1
+                continue
+            # Kalshi binary markets: key uses ticker + empty bucket_label
+            key = (m.ticker, "")
+            fired = self._fired.setdefault(key, set())
+            crossed = [t for t in self._thresholds if m.yes_price >= t and t not in fired]
+            if not crossed:
+                skipped_already_fired += 1
+                continue
+            for t in crossed:
+                fired.add(t)
+                candidates += 1
+                signals.append(self._make_kalshi_signal(m, t))
+
+        # Garbage-collect expired Kalshi markets from _fired.
+        live_keys = {(m.ticker, "") for m in markets}
+        # Only remove Kalshi keys (those with empty bucket_label might overlap if
+        # Polymarket ever has empty labels, so restrict to actually-fired Kalshi entries).
+        self._fired = {
+            k: v for k, v in self._fired.items()
+            if not (k[1] == "" and k not in live_keys and self._exchange == "kalshi")
+        }
+
+        self.log.info(
+            "lazy[kalshi] scan: %d markets total | %d candidate signals | "
+            "skipped: window=%d below_floor=%d max_price=%d already_fired=%d",
+            len(markets), candidates, skipped_window, skipped_below_floor,
+            skipped_max_price, skipped_already_fired,
+        )
+        return signals
+
+    def _make_kalshi_signal(self, m: Any, threshold: float) -> Signal:
+        """Build a Signal from a KalshiWeatherMarket entry."""
+        confidence = max(0.0, min(1.0, m.yes_price))
+        return Signal(
+            market_id=m.ticker,
+            direction="YES",
+            edge=self._claimed_edge,
+            confidence=confidence,
+            market_question=m.title,
+            price=m.yes_price,
+            category="weather",
+            token_id=m.ticker,   # Kalshi uses ticker as the trade target identifier
+            exchange="kalshi",
+            metadata={
+                "city": m.city,
+                "metric": m.metric,
+                "threshold_f": m.threshold_f,
+                "threshold_unit": "fahrenheit",
+                "end_utc": m.end_date_utc.isoformat(),
+                "volume_usd": m.volume_usd,
+                "ladder_threshold": threshold,
+                "ladder_thresholds": list(self._thresholds),
+                "claimed_edge_pct": self._claimed_edge,
+                "lazy_thesis": "crowd_consensus",
+                "neg_risk": False,   # Kalshi binary markets are never neg-risk
+            },
+        )
 
     def _make_signal(self, m: LazyMarket, threshold: float) -> Signal:
         # Confidence reported = the price itself (i.e. crowd-implied prob).

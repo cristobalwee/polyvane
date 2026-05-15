@@ -65,6 +65,9 @@ class WeatherStrategy(BaseStrategy):
     def __init__(self, params: dict[str, Any], context: StrategyContext) -> None:
         super().__init__(params, context)
 
+        # Exchange this instance trades on. Defaults to Polymarket.
+        self._exchange: str = str(params.get("exchange") or "polymarket").lower()
+
         requested = params.get("cities")
         if requested:
             requested = list(requested)
@@ -115,6 +118,7 @@ class WeatherStrategy(BaseStrategy):
 
         self._session: aiohttp.ClientSession | None = None
         self._gamma: GammaClient | None = None
+        self._kalshi_scanner: Any | None = None
         self._forecaster: ForecastClient | None = None
         self._ensemble: EnsembleForecaster | None = None
 
@@ -154,7 +158,7 @@ class WeatherStrategy(BaseStrategy):
         return self._ensemble
 
     async def setup(self) -> None:
-        if not self._tradeable_cities:
+        if not self._tradeable_cities and self._exchange == "polymarket":
             self.log.warning(
                 "WeatherStrategy: no tradeable cities after filtering — scans will "
                 "discover zero markets. Check `cities` and the resolution registry."
@@ -163,11 +167,27 @@ class WeatherStrategy(BaseStrategy):
             for city, reason in self._skipped_cities:
                 self.log.warning("Skipping city %r — %s", city, reason)
         self._session = aiohttp.ClientSession()
-        self._gamma = GammaClient(
-            self._session,
-            request_timeout_sec=self._request_timeout_sec,
-            on_unknown_city=self._handle_unknown_city,
-        )
+
+        if self._exchange == "kalshi":
+            from .kalshi_markets import KalshiMarketScanner
+            kalshi_client = self.context.get_client("kalshi")
+            if kalshi_client is None:
+                self.log.warning(
+                    "WeatherStrategy (Kalshi): no Kalshi client in context — scans will return empty"
+                )
+            self._kalshi_scanner = KalshiMarketScanner(
+                kalshi_client,
+                request_timeout_sec=self._request_timeout_sec,
+            ) if kalshi_client else None
+            self._gamma = None
+        else:
+            self._gamma = GammaClient(
+                self._session,
+                request_timeout_sec=self._request_timeout_sec,
+                on_unknown_city=self._handle_unknown_city,
+            )
+            self._kalshi_scanner = None
+
         self._forecaster = ForecastClient(
             self._session,
             max_rps=self._noaa_max_rps,
@@ -186,8 +206,9 @@ class WeatherStrategy(BaseStrategy):
             c for c, b in self._per_city_bias_f.items() if abs(b) >= self._min_bias_apply_f
         )
         self.log.info(
-            "WeatherStrategy ready: tradeable=%s skipped=%d models=%s min_edge=%.2f adj_edge=%.2f "
-            "min_agreement=%.2f bias_cities=%s",
+            "WeatherStrategy ready: exchange=%s tradeable=%s skipped=%d models=%s min_edge=%.2f "
+            "adj_edge=%.2f min_agreement=%.2f bias_cities=%s",
+            self._exchange,
             sorted(self._tradeable_cities),
             len(self._skipped_cities),
             list(self._model_weights.keys()),
@@ -215,6 +236,11 @@ class WeatherStrategy(BaseStrategy):
     async def scan(self) -> list[Signal]:
         if not self._should_scan_now():
             return []
+        if self._exchange == "kalshi":
+            return await self._scan_kalshi()
+        return await self._scan_polymarket()
+
+    async def _scan_polymarket(self) -> list[Signal]:
         report = await self._run_scan()
         self._last_scan_at = datetime.now(timezone.utc)
 
@@ -249,21 +275,115 @@ class WeatherStrategy(BaseStrategy):
                 price=ws.bucket.price,
                 category="weather",
                 token_id=ws.bucket.token_id,
+                exchange="polymarket",
                 metadata=metadata,
             ))
 
         if signals:
             self.log.info(
-                "scan: %d markets, %d forecasts, %d suppressed (low agreement), %d signal(s)",
+                "scan[polymarket]: %d markets, %d forecasts, %d suppressed (low agreement), %d signal(s)",
                 report.markets_scanned, report.forecasts_fetched,
                 report.suppressed_low_agreement, len(signals),
             )
         else:
             self.log.info(
-                "scan: %d markets, %d forecasts, %d suppressed — no actionable signals",
+                "scan[polymarket]: %d markets, %d forecasts, %d suppressed — no actionable signals",
                 report.markets_scanned, report.forecasts_fetched,
                 report.suppressed_low_agreement,
             )
+        return signals
+
+    async def _scan_kalshi(self) -> list[Signal]:
+        """Scan Kalshi temperature binary markets using CDF exceedance probabilities."""
+        if self._kalshi_scanner is None or self._ensemble is None:
+            return []
+        self._last_scan_at = datetime.now(timezone.utc)
+
+        markets = await self._kalshi_scanner.fetch_active_weather(
+            tradeable_cities=self._tradeable_cities or None,
+        )
+        if not markets:
+            self.log.info("scan[kalshi]: no active weather markets found")
+            return []
+
+        now = datetime.now(timezone.utc)
+        signals: list[Signal] = []
+        forecasts_fetched = 0
+        skipped_window = 0
+        skipped_edge = 0
+
+        for m in markets:
+            hours_to_end = (m.end_date_utc - now).total_seconds() / 3600.0
+            if hours_to_end < self._min_hours or hours_to_end > self._max_horizon_hours:
+                skipped_window += 1
+                continue
+
+            src = resolution.get(m.city)
+            if src is None:
+                continue
+
+            try:
+                forecasts = await self._ensemble.fetch_member_forecasts(
+                    src=src,
+                    target_date=m.target_date,
+                    metric=m.metric,
+                    unit="fahrenheit",
+                )
+            except Exception:
+                self.log.debug(
+                    "Kalshi forecast fetch failed for %s %s", m.city, m.ticker, exc_info=True
+                )
+                continue
+
+            if not forecasts:
+                continue
+            forecasts_fetched += len(forecasts)
+
+            # P(temp >= threshold_f) under the Gaussian mixture.
+            prob = self._ensemble.cdf_exceedance(
+                forecasts, m.threshold_f, city=m.city
+            )
+            edge = prob - m.yes_price
+
+            if abs(edge) < self._min_edge:
+                skipped_edge += 1
+                continue
+            if abs(edge) > self._max_edge_sanity:
+                self.log.warning(
+                    "Kalshi: skipping implausibly large edge (city=%s ticker=%s edge=%.2f cap=%.2f)",
+                    m.city, m.ticker, edge, self._max_edge_sanity,
+                )
+                continue
+
+            confidence = max(0.0, min(1.0, prob))
+            signals.append(Signal(
+                market_id=m.ticker,
+                direction="YES",
+                edge=edge,
+                confidence=confidence,
+                market_question=m.title,
+                price=m.yes_price,
+                category="weather",
+                token_id=m.ticker,
+                exchange="kalshi",
+                metadata={
+                    "city": m.city,
+                    "metric": m.metric,
+                    "threshold_f": m.threshold_f,
+                    "threshold_unit": "fahrenheit",
+                    "model_prob": prob,
+                    "target_date": m.target_date.isoformat(),
+                    "end_utc": m.end_date_utc.isoformat(),
+                    "volume_usd": m.volume_usd,
+                    "neg_risk": False,
+                    "bucket_role": "primary",
+                },
+            ))
+
+        self.log.info(
+            "scan[kalshi]: %d markets, %d forecasts, %d skipped(window), %d skipped(edge), %d signal(s)",
+            len(markets), forecasts_fetched, skipped_window, skipped_edge, len(signals),
+        )
         return signals
 
     async def evaluate(self, signal: Signal) -> TradeIntent | None:
