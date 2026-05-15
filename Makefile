@@ -236,3 +236,15 @@ api-restart: _check-ssh
 # VPS itself (no API key needed for /ping).
 api-status: _check-ssh
 	ssh -t $(SSH) "systemctl --no-pager --full status polyvane-api | head -n 20 && echo --- && curl -sS -m 5 http://127.0.0.1:8099/api/v1/ping || echo 'ping failed'"
+
+# Archive trade journal and wipe logs clean
+journal-archive: _check-ssh
+	@echo "==> archiving journal + logs on $(SSH)"
+	@read -p "Confirm archive (overwrites no data, renames only) [y/N] " ans; [ "$$ans" = "y" ]
+	ssh $(SSH) "sudo systemctl stop polyvane polyvane-api && \
+	    TS=\$$(date -u +%Y-%m-%dT%H%M%SZ) && \
+	    sudo -u polyvane mv $(INSTALL_DIR)/data/trade_journal.db $(INSTALL_DIR)/data/trade_journal.archive-\$$TS.db && \
+	    sudo -u polyvane mv $(INSTALL_DIR)/logs/polyvane.log $(INSTALL_DIR)/logs/polyvane.archive-\$$TS.log && \
+	    sudo -u polyvane mv $(INSTALL_DIR)/logs/trades.log $(INSTALL_DIR)/logs/trades.archive-\$$TS.log 2>/dev/null || true && \
+	    sudo systemctl start polyvane polyvane-api && sleep 2 && \
+	    systemctl --no-pager status polyvane | head -n 8"

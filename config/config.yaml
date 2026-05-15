@@ -30,6 +30,9 @@ risk:
   max_category_exposure_pct: 1.0
   # Minimum edge required to consider a signal tradeable (10% = 0.10).
   min_edge_pct: 0.10
+  # Stop-loss threshold. Exit any open position whose current midpoint has
+  # fallen to <= (1 - stop_loss_pct) × entry_price. 0.50 = exit at -50%.
+  stop_loss_pct: 0.50
   # Volume-aware position caps. The first tier whose [min, max) range
   # contains the market's volumeUsd determines the per-trade ceiling.
   # Calibrated to April 2026 Polymarket conditions: deeper books at the top
@@ -38,15 +41,15 @@ risk:
     - name: low
       min_volume_usd: 0
       max_volume_usd: 50000
-      max_position_usd: 3.0
+      max_position_usd: 10.0
     - name: mid
       min_volume_usd: 50000
       max_volume_usd: 200000
-      max_position_usd: 8.0
+      max_position_usd: 15.0
     - name: high
       min_volume_usd: 200000
       max_volume_usd: inf
-      max_position_usd: 15.0
+      max_position_usd: 25.0
   # Reject a new trade when the strategy already holds an open position on
   # the same market_id. Default true. Strategies in the override map below
   # use their own value — `lazy` opts out so its price-ladder rungs aren't
@@ -228,12 +231,12 @@ strategies:
   - name: lazy
     enabled: true
     params:
-      thresholds: [0.60, 0.65, 0.75, 0.85]
+      thresholds: [0.60, 0.75]
       claimed_edge_pct: 0.10
       max_price: 0.95
       min_hours_to_resolution: 12
       max_forecast_horizon_hours: 48
-      scan_interval_sec: 300
+      scan_interval_sec: 90
       min_liquidity_usd: 100.0
 
   # ---- Other strategies (still scaffolds — disabled) -------------------

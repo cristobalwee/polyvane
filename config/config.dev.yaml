@@ -1,0 +1,3 @@
+logger:
+  db_path: data/trade_journal.remote.db
+  level: DEBUG

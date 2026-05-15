@@ -40,6 +40,7 @@ from core.logger import TradeJournal
 from core.logging_config import setup_logging
 from core.market_cache import MarketCache
 from core.risk import RiskConfig, RiskManager
+from core.stop_loss import StopLossManager
 from core.wallet import Wallet, WalletConfig
 from monitoring.alerts import AlertBus, AlertConfig, is_summary_due, utc_now
 from monitoring.health import HealthConfig, HealthMonitor
@@ -263,6 +264,25 @@ async def strategy_loop(
                 pass
     finally:
         await strategy.teardown()
+
+
+async def stop_loss_loop(
+    stop_loss: StopLossManager,
+    interval_sec: float,
+    stop_event: asyncio.Event,
+    log: logging.Logger,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            stopped = await stop_loss.check_and_execute()
+            if stopped:
+                log.info("stop_loss: exited %d position(s) via stop-loss", stopped)
+        except Exception:
+            log.exception("stop_loss_loop raised")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_sec)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def risk_monitor_loop(
@@ -538,6 +558,14 @@ async def run(config_path: Path) -> int:
 
     executor = Executor(exec_cfg, risk, journal, client)
 
+    stop_loss_pct = float(cfg["risk"].get("stop_loss_pct", 0.50))
+    stop_loss = StopLossManager(
+        journal=journal,
+        client=client,
+        is_paper=exec_cfg.is_paper,
+        stop_loss_pct=stop_loss_pct,
+    )
+
     monitoring_cfg = cfg.get("monitoring") or {}
     # Bridge env vars into the alert config. The webhook URL is a secret —
     # we don't want it in the YAML that gets rsynced. Env var wins when set;
@@ -568,6 +596,7 @@ async def run(config_path: Path) -> int:
 
     risk.set_alert_hook(alerts.emit)
     executor.set_alert_hook(alerts.emit)
+    stop_loss.set_alert_hook(alerts.emit)
 
     market_cache_ttl = float(cfg.get("market_cache", {}).get("default_ttl_sec", 30.0))
     market_cache = MarketCache(default_ttl_sec=market_cache_ttl)
@@ -638,6 +667,15 @@ async def run(config_path: Path) -> int:
         asyncio.create_task(
             risk_monitor_loop(risk, float(cfg["polling"]["risk_check_interval_sec"]), stop_event, log),
             name="risk_monitor",
+        ),
+        asyncio.create_task(
+            stop_loss_loop(
+                stop_loss,
+                float(cfg["polling"]["position_check_interval_sec"]),
+                stop_event,
+                log,
+            ),
+            name="stop_loss",
         ),
         asyncio.create_task(
             daily_summary_loop(

@@ -40,6 +40,7 @@ EVENT_TYPES = (
     "error",
     "new_city_detected",
     "health_warning",
+    "stop_loss_triggered",
 )
 
 
@@ -515,6 +516,16 @@ def format_message(
         )
     if event_type == "health_warning":
         return f"❤️‍🩹 **Health** — {payload.get('message', 'see logs')}"
+    if event_type == "stop_loss_triggered":
+        question = payload.get("market_question") or payload.get("market_id") or "?"
+        return (
+            f"🛑 **Stop-loss** [{payload.get('strategy')}] "
+            f"`{question}` — "
+            f"entry {payload.get('entry_price', 0.0):.3f} → "
+            f"exit {payload.get('exit_price', 0.0):.3f} "
+            f"(-{payload.get('loss_pct', 0.0):.0f}%) "
+            f"PnL ${payload.get('pnl', 0.0):+.2f}"
+        )
     return f"[{event_type}] {payload}"
 
 
