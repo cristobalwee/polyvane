@@ -258,6 +258,7 @@ class StopLossManager:
             ticker=ticker,
             side=side,
             count=count,
+            action="sell",
             yes_price=yes_price_cents if side == "yes" else None,
             no_price=(100 - yes_price_cents) if side == "no" else None,
         )

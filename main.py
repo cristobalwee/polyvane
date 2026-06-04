@@ -113,6 +113,13 @@ def load_strategies(
     return strategies
 
 
+def _strategy_instance_name(entry: dict[str, Any]) -> str:
+    """Return the configured runtime instance name for a strategy entry."""
+    name = str(entry.get("name") or "")
+    exchange = str((entry.get("params") or {}).get("exchange") or "polymarket").lower()
+    return f"{name}_{exchange}" if exchange != "polymarket" else name
+
+
 def _print_startup_banner(
     log: logging.Logger,
     *,
@@ -253,7 +260,7 @@ async def strategy_loop(
                     signals = []
 
                 for sig in signals:
-                    sig.metadata.setdefault("strategy", strategy.name)
+                    sig.metadata.setdefault("strategy", getattr(strategy, "_instance_name", strategy.name))
                     try:
                         intent: TradeIntent | None = await strategy.evaluate(sig)
                     except Exception:
@@ -535,10 +542,10 @@ async def run(config_path: Path) -> int:
 
     journal = TradeJournal(PROJECT_ROOT / cfg["logger"]["db_path"])
 
-    exec_cfg = ExecutionConfig.from_dict(cfg["execution"])
-    risk = RiskManager(RiskConfig.from_dict(cfg["risk"]), journal, is_paper=exec_cfg.is_paper)
     client = ClobClient(ClientConfig.from_dict(cfg["api"]))
     wallet = Wallet(WalletConfig(rpc_url=os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")))
+
+    exec_cfg = ExecutionConfig.from_dict(cfg["execution"])
 
     if exec_cfg.is_paper:
         client.initialize_unauthenticated()
@@ -579,9 +586,9 @@ async def run(config_path: Path) -> int:
             "key_id": os.getenv("KALSHI_KEY_ID", ""),
             "private_key_path": os.getenv("KALSHI_PRIVATE_KEY_PATH", ""),
             "base_url": (
-                kalshi_cfg_raw.get("demo_base_url", "https://demo-api.kalshi.co/trade-api/v2")
+                kalshi_cfg_raw.get("demo_base_url", "https://api.elections.kalshi.com/trade-api/v2")
                 if kalshi_mode == "paper"
-                else kalshi_cfg_raw.get("live_base_url", "https://trading-api.kalshi.com/trade-api/v2")
+                else kalshi_cfg_raw.get("live_base_url", "https://api.elections.kalshi.com/trade-api/v2")
             ),
         })
         kalshi_client = KalshiClient(kalshi_client_cfg)
@@ -627,9 +634,17 @@ async def run(config_path: Path) -> int:
 
     # Rebuild exec_cfg now that kalshi_mode is resolved so is_paper_for() is correct.
     exec_cfg = ExecutionConfig.from_dict(cfg["execution"])
+    all_exchanges_paper = exec_cfg.mode == "paper" and exec_cfg.kalshi_mode == "paper"
+    risk = RiskManager(
+        RiskConfig.from_dict(cfg["risk"]),
+        journal,
+        is_paper=all_exchanges_paper,
+    )
 
     # Banner — printed AFTER initialization so the mode line reflects reality.
-    enabled_strategy_names = [s["name"] for s in cfg.get("strategies", []) if s.get("enabled")]
+    enabled_strategy_names = [
+        _strategy_instance_name(s) for s in cfg.get("strategies", []) if s.get("enabled")
+    ]
     weather_cfg = next(
         (s for s in cfg.get("strategies", []) if s.get("name") == "weather" and s.get("enabled")),
         None,
@@ -678,7 +693,7 @@ async def run(config_path: Path) -> int:
         health_cfg,
         alert_hook=alerts.emit,
         wallet_balance_provider=(wallet.get_pusd_balance if wallet.is_initialized else None),
-        is_paper_mode=exec_cfg.is_paper,
+        is_paper_mode=all_exchanges_paper,
     )
 
     review_dict = dict(monitoring_cfg.get("review") or {})
@@ -687,7 +702,7 @@ async def run(config_path: Path) -> int:
             "kalshi_base_url",
             kalshi_cfg_raw.get(
                 "demo_base_url" if kalshi_mode == "paper" else "live_base_url",
-                "https://demo-api.kalshi.co/trade-api/v2",
+                "https://api.elections.kalshi.com/trade-api/v2",
             ),
         )
     reviewer_cfg = ReviewerConfig.from_dict(review_dict)
@@ -808,7 +823,7 @@ async def run(config_path: Path) -> int:
         )
 
     log.info("Event loop running with %d strategy task(s).", len(strategies))
-    if exec_cfg.is_paper:
+    if all_exchanges_paper:
         log.info("Paper mode: circuit breaker disabled — daily-loss halt will not engage.")
     await stop_event.wait()
     log.info("Stop requested. Cancelling %d task(s)...", len(tasks))

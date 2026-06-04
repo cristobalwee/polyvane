@@ -64,6 +64,27 @@ _KALSHI_CITY_CODES: dict[str, str] = {
     "DFW": "Dallas",    # alternate Dallas code
     "ORD": "Chicago",   # alternate Chicago code
     "JFK": "NYC",       # alternate NYC code
+    "NY": "NYC",
+    # Newer Kalshi temperature tickers often prefix the venue/city code with T.
+    "TATL": "Atlanta",
+    "TAUS": "Austin",
+    "TBOS": "Boston",
+    "TCHI": "Chicago",
+    "TDAL": "Dallas",
+    "TDEN": "Denver",
+    "THOU": "Houston",
+    "TLAX": "Los Angeles",
+    "TLV": "Las Vegas",
+    "TMIA": "Miami",
+    "TMIN": "Minneapolis",
+    "TNOLA": "New Orleans",
+    "TNYC": "NYC",
+    "TOKC": "Oklahoma City",
+    "TPHIL": "Philadelphia",
+    "TPHX": "Phoenix",
+    "TSATX": "San Antonio",
+    "TSEA": "Seattle",
+    "TSFO": "San Francisco",
 }
 
 
@@ -133,7 +154,7 @@ class KalshiMarketScanner:
             log.warning("KalshiMarketScanner: client not initialized — returning empty list")
             return []
 
-        raw_markets = await self._paginate_markets()
+        raw_markets = await self._fetch_weather_markets(tradeable_cities=tradeable_cities)
         results: list[KalshiWeatherMarket] = []
         unknown_codes: set[str] = set()
 
@@ -204,26 +225,56 @@ class KalshiMarketScanner:
         )
         return results
 
-    async def _paginate_markets(self) -> list[dict[str, Any]]:
-        """Paginate through all open Kalshi markets, collecting weather tickers."""
+    async def _fetch_weather_markets(
+        self,
+        *,
+        tradeable_cities: set[str] | None,
+    ) -> list[dict[str, Any]]:
+        """Fetch open weather markets by series ticker instead of broad pagination."""
         all_markets: list[dict[str, Any]] = []
-        cursor = ""
-        while True:
-            try:
-                resp = await self._client.get_markets(status="open", cursor=cursor, limit=200)
-            except Exception:
-                log.warning("KalshiMarketScanner: failed to fetch markets page", exc_info=True)
-                break
+        seen: set[str] = set()
+        for series_ticker in self._series_tickers(tradeable_cities):
+            cursor = ""
+            while True:
+                try:
+                    resp = await self._client.get_markets(
+                        status="open",
+                        cursor=cursor,
+                        limit=200,
+                        series_ticker=series_ticker,
+                    )
+                except Exception:
+                    log.debug(
+                        "KalshiMarketScanner: failed to fetch series %s",
+                        series_ticker,
+                        exc_info=True,
+                    )
+                    break
 
-            page = resp.get("markets") or []
-            for raw in page:
-                ticker = raw.get("ticker") or ""
-                if _TICKER_RE.match(ticker):
+                page = resp.get("markets") or []
+                for raw in page:
+                    ticker = raw.get("ticker") or ""
+                    if ticker in seen or not _TICKER_RE.match(ticker):
+                        continue
+                    seen.add(ticker)
                     all_markets.append(raw)
 
-            next_cursor = resp.get("cursor") or ""
-            if not next_cursor or not page:
-                break
-            cursor = next_cursor
+                next_cursor = resp.get("cursor") or ""
+                if not next_cursor or not page:
+                    break
+                cursor = next_cursor
 
         return all_markets
+
+    @staticmethod
+    def _series_tickers(tradeable_cities: set[str] | None) -> list[str]:
+        """Return likely Kalshi high/low temperature series tickers."""
+        city_codes = sorted({
+            code for code, city in _KALSHI_CITY_CODES.items()
+            if tradeable_cities is None or city in tradeable_cities
+        })
+        return [
+            f"KX{metric}{code}"
+            for code in city_codes
+            for metric in ("HIGH", "LOW")
+        ]

@@ -133,12 +133,16 @@ class AlertBus:
         if event_type == "new_city_detected" and not self.config.new_city_notifications:
             return
         # Per-event-type cooldown; circuit_breaker bypasses (always alert).
+        # For trade_executed, bucket by exchange so Polymarket and Kalshi
+        # notifications don't suppress each other.
         if event_type != "circuit_breaker":
             now = time.monotonic()
-            last = self._last_emit_at.get(event_type, 0.0)
+            exchange = payload.get("metadata", {}).get("exchange") if event_type == "trade_executed" else None
+            cooldown_key = f"{event_type}:{exchange}" if exchange else event_type
+            last = self._last_emit_at.get(cooldown_key, 0.0)
             if now - last < self.config.alert_cooldown_sec:
                 return
-            self._last_emit_at[event_type] = now
+            self._last_emit_at[cooldown_key] = now
         try:
             self._queue.put_nowait(_AlertEvent(event_type, payload))
         except asyncio.QueueFull:

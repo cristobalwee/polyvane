@@ -17,6 +17,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 from tenacity import (
@@ -29,7 +30,7 @@ from tenacity import (
 log = logging.getLogger(__name__)
 
 KALSHI_DEMO_BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
-KALSHI_LIVE_BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
+KALSHI_LIVE_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
 
 class KalshiTransientError(Exception):
@@ -141,7 +142,14 @@ class KalshiClient:
         except ImportError as exc:
             raise RuntimeError("pycryptodome required for request signing") from exc
         ts_ms = str(int(time.time() * 1000))
-        message = f"{ts_ms}{method.upper()}{path}"
+        # Kalshi signs the FULL request path, including the API prefix that
+        # lives in base_url (e.g. "/trade-api/v2"). Signing only the bare
+        # endpoint path ("/markets") yields a 401 "missing or invalid
+        # signature". Derive the prefix from base_url so this stays correct
+        # regardless of host/version.
+        base_path = urlparse(self.config.base_url).path.rstrip("/")
+        full_path = f"{base_path}{path}"
+        message = f"{ts_ms}{method.upper()}{full_path}"
         h = SHA256.new(message.encode("utf-8"))
         sig = pkcs1_15.new(self._rsa_key).sign(h)
         return {
@@ -223,6 +231,8 @@ class KalshiClient:
         *,
         status: str = "open",
         ticker_prefix: str | None = None,
+        series_ticker: str | None = None,
+        event_ticker: str | None = None,
         cursor: str = "",
         limit: int = 200,
     ) -> dict[str, Any]:
@@ -231,6 +241,10 @@ class KalshiClient:
             params["cursor"] = cursor
         if ticker_prefix:
             params["tickers"] = ticker_prefix
+        if series_ticker:
+            params["series_ticker"] = series_ticker
+        if event_ticker:
+            params["event_ticker"] = event_ticker
         return await self._get("/markets", params=params)
 
     async def get_market(self, ticker: str) -> dict[str, Any]:
@@ -282,6 +296,7 @@ class KalshiClient:
         side: str,
         count: int,
         *,
+        action: str = "buy",
         yes_price: int | None = None,
         no_price: int | None = None,
         order_type: str = "limit",
@@ -289,9 +304,12 @@ class KalshiClient:
     ) -> dict[str, Any]:
         if not self._authenticated:
             raise RuntimeError("KalshiClient not authenticated — cannot place orders")
+        action = action.lower()
+        if action not in ("buy", "sell"):
+            raise ValueError(f"Kalshi order action must be 'buy' or 'sell', got {action!r}")
         body: dict[str, Any] = {
             "ticker": ticker,
-            "action": "buy",
+            "action": action,
             "side": side,
             "count": count,
             "type": order_type,

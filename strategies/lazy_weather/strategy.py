@@ -55,6 +55,8 @@ class LazyWeatherStrategy(BaseStrategy):
         self._min_liquidity: float = float(params.get("min_liquidity_usd", 100.0))
         self._max_price: float = float(params.get("max_price", 0.95))
         self._request_timeout_sec: float = float(params.get("request_timeout_sec", 15.0))
+        cities = params.get("cities") or []
+        self._kalshi_cities: set[str] | None = {str(c) for c in cities} if cities else None
 
         self._session: aiohttp.ClientSession | None = None
         self._scanner: LazyGammaScanner | None = None
@@ -118,8 +120,9 @@ class LazyWeatherStrategy(BaseStrategy):
             self.log.warning("failed to read open positions for hydration", exc_info=True)
             return
         seeded_rungs = 0
+        instance_name = getattr(self, "_instance_name", self.name)
         for row in rows:
-            if row.get("strategy") != self.name:
+            if row.get("strategy") not in (self.name, instance_name):
                 continue
             try:
                 meta = json.loads(row.get("metadata_json") or "{}")
@@ -213,7 +216,9 @@ class LazyWeatherStrategy(BaseStrategy):
     async def _scan_kalshi(self) -> list[Signal]:
         if self._kalshi_scanner is None:
             return []
-        markets = await self._kalshi_scanner.fetch_active_weather()
+        markets = await self._kalshi_scanner.fetch_active_weather(
+            tradeable_cities=self._kalshi_cities,
+        )
         self._last_scan_at = datetime.now(timezone.utc)
         if not markets:
             return []

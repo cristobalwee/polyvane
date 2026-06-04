@@ -42,6 +42,7 @@ rsync -az --delete \
     --exclude='.calibrate-cache/' \
     --exclude='.DS_Store' \
     --exclude='.claude/' \
+    --exclude='secrets/' \
     --rsync-path='sudo rsync' \
     "$PROJECT_ROOT/" "$REMOTE:$INSTALL_DIR/"
 
@@ -53,13 +54,17 @@ cd /opt/polyvane
 sudo chown -R polyvane:polyvane /opt/polyvane
 /opt/polyvane/venv/bin/pip install --quiet --upgrade -r requirements.txt
 echo "==> restarting polyvane.service"
-sudo systemctl restart polyvane
+sudo systemctl restart polyvane && RESTART_OK=1 || RESTART_OK=0
 sleep 2
 echo "==> systemctl status (head)"
 systemctl --no-pager --full status polyvane | head -n 15 || true
-echo "==> last 10 log lines:"
-sudo tail -n 10 /opt/polyvane/logs/polyvane.log 2>/dev/null \
-    || sudo journalctl -u polyvane -n 10 --no-pager
+echo "==> last 20 log lines:"
+sudo tail -n 20 /opt/polyvane/logs/polyvane.log 2>/dev/null \
+    || sudo journalctl -u polyvane -n 20 --no-pager
+if [[ "$RESTART_OK" -eq 0 ]]; then
+    echo "==> ERROR: polyvane.service failed to start (see logs above)"
+    exit 1
+fi
 REMOTE_EOF
 
 echo "==> done"

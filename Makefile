@@ -1,4 +1,4 @@
-.PHONY: help run run-live dashboard backtest calibrate add-city verify-sources test lint \
+.PHONY: help run run-live kalshi-paper-smoke dashboard backtest calibrate add-city verify-sources test lint \
         deploy logs logs-trades logs-errors status restart go-live go-paper scan-now \
         remote-dashboard derive-creds perf perf-7d perf-all remote-perf \
         report report-7d report-all remote-report \
@@ -24,6 +24,7 @@ help:
 	@echo " local"
 	@echo "  make run             Start the bot in paper mode (config/config.yaml)"
 	@echo "  make run-live        Start in live mode (requires LIVE=true env var)"
+	@echo "  make kalshi-paper-smoke  One-shot Kalshi scan + paper execution test"
 	@echo "  make dashboard       Show the local P&L dashboard"
 	@echo "  make backtest        Run a backtest over the last 30 days (override START/END)"
 	@echo "  make calibrate       Run the per-model + per-city calibration script"
@@ -78,6 +79,9 @@ run-live:
 		exit 1; \
 	fi
 	TRADING_MODE=live $(PY) main.py $(CONFIG)
+
+kalshi-paper-smoke:
+	$(PY) -m scripts.kalshi_paper_smoke --config $(CONFIG)
 
 dashboard:
 	$(PY) -m monitoring.dashboard
@@ -157,11 +161,15 @@ status: _check-ssh
 restart: _check-ssh
 	ssh -t $(SSH) "sudo systemctl restart polyvane && sleep 2 && systemctl --no-pager status polyvane | head -n 12"
 
-# Switch the deployed bot to LIVE mode. Requires creds already pasted into
-# /opt/polyvane/.env (PK + CLOB_API_KEY + CLOB_SECRET + CLOB_PASS_PHRASE).
+# Switch the deployed bot to Kalshi LIVE mode. Requires Kalshi creds already
+# pasted into /opt/polyvane/.env. Polymarket stays paper by leaving
+# TRADING_MODE=paper.
 go-live: _check-ssh
-	@echo "==> switching $(SSH) to LIVE mode"
-	ssh $(SSH) "sudo sed -i 's/^TRADING_MODE=.*/TRADING_MODE=live/' $(INSTALL_DIR)/.env && \
+	@echo "==> switching $(SSH) to KALSHI live mode"
+	ssh $(SSH) "sudo grep -q '^KALSHI_MODE=' $(INSTALL_DIR)/.env && \
+	             sudo sed -i 's/^KALSHI_MODE=.*/KALSHI_MODE=live/' $(INSTALL_DIR)/.env || \
+	             echo KALSHI_MODE=live | sudo tee -a $(INSTALL_DIR)/.env >/dev/null && \
+	             sudo sed -i 's/^TRADING_MODE=.*/TRADING_MODE=paper/' $(INSTALL_DIR)/.env && \
 	             sudo touch $(INSTALL_DIR)/.live-trading-enabled && \
 	             sudo chown polyvane:polyvane $(INSTALL_DIR)/.live-trading-enabled && \
 	             sudo systemctl restart polyvane && sleep 3 && \
@@ -171,6 +179,7 @@ go-live: _check-ssh
 go-paper: _check-ssh
 	@echo "==> switching $(SSH) to PAPER mode"
 	ssh $(SSH) "sudo sed -i 's/^TRADING_MODE=.*/TRADING_MODE=paper/' $(INSTALL_DIR)/.env && \
+	             sudo grep -q '^KALSHI_MODE=' $(INSTALL_DIR)/.env && sudo sed -i 's/^KALSHI_MODE=.*/KALSHI_MODE=paper/' $(INSTALL_DIR)/.env || true && \
 	             sudo rm -f $(INSTALL_DIR)/.live-trading-enabled && \
 	             sudo systemctl restart polyvane && sleep 3 && \
 	             systemctl --no-pager status polyvane | head -n 12"

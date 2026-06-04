@@ -44,6 +44,12 @@ class ExecutionConfig:
     limit_offset_pct: float
     max_order_retries: int
     retry_backoff_sec: float
+    # Per-strategy live allowlist. When non-empty, ONLY these strategy
+    # instance names may submit live orders — every other strategy stays in
+    # paper even on a live exchange. Empty = legacy behavior (exchange mode
+    # governs all strategies). Strategy names are the instance names recorded
+    # in trade metadata (e.g. "lazy_kalshi"), matching dedup/bankroll keys.
+    live_strategies: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ExecutionConfig":
@@ -61,6 +67,9 @@ class ExecutionConfig:
             limit_offset_pct=float(d["limit_offset_pct"]),
             max_order_retries=int(d["max_order_retries"]),
             retry_backoff_sec=float(d["retry_backoff_sec"]),
+            live_strategies=tuple(
+                str(s) for s in (d.get("live_strategies") or [])
+            ),
         )
 
     @property
@@ -72,6 +81,20 @@ class ExecutionConfig:
         if exchange == "kalshi":
             return self.kalshi_mode == "paper"
         return self.mode == "paper"
+
+    def is_paper_for_strategy(self, exchange: str, strategy: str) -> bool:
+        """True if this (exchange, strategy) trade must be paper.
+
+        A trade only goes live when (1) the exchange is in live mode AND
+        (2) either no live allowlist is configured, or the strategy is on it.
+        This lets a single live exchange host both live and paper strategies
+        (e.g. lazy_kalshi live while weather_kalshi stays paper).
+        """
+        if self.is_paper_for(exchange):
+            return True
+        if self.live_strategies and strategy not in self.live_strategies:
+            return True
+        return False
 
 
 @dataclass
@@ -176,6 +199,8 @@ class Executor:
     async def submit(self, intent: TradeIntent, *, bankroll_usd: float) -> ExecutionResult:
         sig = intent.signal
         exchange = getattr(sig, "exchange", "polymarket")
+        strategy_name = self.context_strategy(intent)
+        is_paper = self.config.is_paper_for_strategy(exchange, strategy_name)
         bucket = sig.metadata.get("bucket") or sig.market_question or "?"
 
         if sig.price is None:
@@ -233,7 +258,7 @@ class Executor:
             "confidence": sig.confidence,
             "token_id": sig.token_id,
             "intent_reason": intent.reason,
-            "mode": self.config.mode if exchange != "kalshi" else self.config.kalshi_mode,
+            "mode": "paper" if is_paper else "live",
             "order_type": self.config.order_type,
             "staged_entry": self.config.staged_entry,
             "volume_tier": decision.volume_tier,
@@ -267,13 +292,13 @@ class Executor:
             "size_usd": size_usd,
             "edge": sig.edge,
             "tier": decision.volume_tier,
-            "mode": self.config.mode,
+            "mode": "paper" if is_paper else "live",
             "metadata": dict(metadata),
         })
 
         side_str = "BUY" if sig.direction == "YES" else "SELL"
 
-        if self.config.is_paper_for(exchange):
+        if is_paper:
             log.trade(
                 "TRADE_PAPER | market=%s | exchange=%s | bucket=%s | side=%s | price=$%.4f | size=$%.2f | shares=%.2f | edge=%.4f | trade_id=%d",
                 sig.market_id, exchange, bucket, side_str, sig.price, size_usd, shares, sig.edge, trade_id,

@@ -1,4 +1,4 @@
-# Polymarket trading bot configuration.
+# Kalshi-first trading bot configuration.
 # All tunable parameters live here. Conservative defaults — review before going live.
 
 risk:
@@ -6,7 +6,10 @@ risk:
   kelly_fraction: 0.25
   # Hard global ceiling on any single position in USD. Volume tiers below
   # narrow this further per-market; whichever is tighter wins.
-  max_position_usd: 15.0
+  # Tightened to $10 for the first live Kalshi (lazy_kalshi) run — guarantees
+  # every live order is <= $10 regardless of volume tier. Scale back up once
+  # the live rollout is validated.
+  max_position_usd: 10.0
   # Maximum NEW positions opened per UTC day across ALL strategies. This is
   # a global ceiling — for paper testing the per-strategy cap below is what
   # actually shapes behavior; this just keeps a runaway bot from filling the
@@ -64,7 +67,16 @@ execution:
   # `mode` controls Polymarket. `kalshi_mode` controls Kalshi independently.
   # If kalshi_mode is omitted it inherits from mode.
   mode: paper
+  # Staged for live: flip to `live` once paper validation looks good. While
+  # this is `paper`, ALL Kalshi strategies are paper regardless of the
+  # allowlist below (is_paper_for() short-circuits).
   kalshi_mode: paper
+  # Per-strategy live allowlist. ONLY these strategy instance names submit
+  # live orders; every other strategy stays in paper even on a live exchange.
+  # Inert while kalshi_mode is paper. The default live allowlist is Kalshi-only.
+  live_strategies:
+    - lazy_kalshi
+    - weather_kalshi
   # limit | market. Polymarket CLOB uses limit-style GTC orders by default.
   order_type: limit
   # If true, splits each entry into multiple tranches to reduce slippage/fill risk.
@@ -106,10 +118,18 @@ api:
   retry_max_delay_sec: 30.0
   # Kalshi API settings. When present, a KalshiClient is initialized
   # alongside the Polymarket client and Kalshi strategy instances can trade.
-  # Auth env vars: KALSHI_KEY_ID + KALSHI_PRIVATE_KEY_PATH (live mode only).
+  # Auth env vars: KALSHI_KEY_ID + KALSHI_PRIVATE_KEY_PATH.
+  #
+  # NOTE on paper vs live: paper mode reads live production market data —
+  # the demo sandbox at demo-api.kalshi.co does NOT list the daily
+  # KXHIGH/KXLOW weather contracts, so pointing paper mode at demo means
+  # zero signals. Paper/live distinction is enforced at order-submission
+  # time via ExecutionConfig.is_paper_for(), not at the read URL.
+  # Override demo_base_url to https://demo-api.kalshi.co/trade-api/v2 only
+  # if you specifically want to exercise the sandbox.
   kalshi:
-    demo_base_url: https://demo-api.kalshi.co/trade-api/v2
-    live_base_url: https://trading-api.kalshi.com/trade-api/v2
+    demo_base_url: https://api.elections.kalshi.com/trade-api/v2
+    live_base_url: https://api.elections.kalshi.com/trade-api/v2
     request_timeout_sec: 10
     retry_max_attempts: 3
     retry_initial_delay_sec: 1.0
@@ -131,9 +151,11 @@ monitoring:
     weekly_review_day: sunday
     bias_flag_threshold_pct: 0.02
     mismatch_std_dev_multiple: 2.0
-    # Kalshi REST base URL for resolution polling (public endpoint, no auth).
-    # Switch to live_base_url when kalshi_mode=live.
-    kalshi_base_url: "https://demo-api.kalshi.co/trade-api/v2"
+    # Kalshi REST base URL for resolution polling. Auth is required by
+    # Kalshi on all endpoints; the reviewer reuses the client's session
+    # via main.py defaults (overridden below only if you want a different
+    # endpoint for resolution lookups than for live scanning).
+    kalshi_base_url: "https://api.elections.kalshi.com/trade-api/v2"
   health:
     # Minimum pUSD wallet balance before trading is paused (live mode).
     min_wallet_balance_usd: 20.0
@@ -182,7 +204,10 @@ _weather_cities: &weather_cities
 # Strategy registry. Each entry: name (must match a module under strategies/),
 # enabled flag, and a free-form `params` block passed to the strategy at init.
 strategies:
-  # ---- Weather (consolidated) ------------------------------------------
+  # ---- Weather (Polymarket, dormant) -----------------------------------
+  # Kept for future reactivation, but disabled by default so the service only
+  # scans Kalshi markets. Flip this back on only if you intentionally want
+  # Polymarket exposure again.
   # Single weather strategy, replacing the previous baseline / aggressive /
   # conservative split. The split was masking a model bug: the conservative
   # variant's tight `min_agreement` gate combined with uncalibrated forecast
@@ -194,7 +219,7 @@ strategies:
   # historical-archive endpoint returned no samples during calibration —
   # re-add once the data path is verified.
   - name: weather
-    enabled: true
+    enabled: false
     params:
       cities: *weather_cities
       require_confirmed_resolution: true
@@ -231,6 +256,12 @@ strategies:
       min_edge_pct: 0.15
       adjacent_min_edge_pct: 0.10
       trade_adjacent_buckets: true
+      # Absolute floor on model_prob. Edge alone can be inflated by tiny
+      # YES prices on long-shot adjacent buckets — 0.05 model_prob vs
+      # $0.005 price still clears the 0.04 adjacent edge gate. The
+      # 2026-05-10..25 paper journal shows model_prob<0.20 was a -$526
+      # bucket across 128 trades, vs +$2046 across 74 trades in [0.20, 0.30).
+      min_model_prob: 0.20
       # Reject signals claiming edge above this — almost always a model bug
       # (sign error, probability inflation, uncorrected per-city bias).
       max_edge_sanity: 0.30
@@ -241,14 +272,16 @@ strategies:
       min_liquidity_usd: 100.0
       noaa_max_rps: 5.0
 
-  # ---- Lazy (consolidated, with price-conviction ladder) ---------------
+  # ---- Lazy (Polymarket, dormant) --------------------------------------
+  # Same strategy implementation as Kalshi lazy, but pointed at Polymarket's
+  # temperature buckets. Disabled by default.
   # Replaces lazy_50 / lazy_60 / lazy_70. Entry floor $0.60 (proven by
   # 30-day journal: 1W/5L below $0.55, 50% WR at $0.55–0.60, 100% WR at
   # $0.60+). Each higher rung is a pyramid add fired exactly once per
   # (market_id, bucket_label). Requires the dedup override above so the
   # adds don't collide with the first entry.
   - name: lazy
-    enabled: true
+    enabled: false
     params:
       thresholds: [0.60, 0.75]
       claimed_edge_pct: 0.10
@@ -258,19 +291,19 @@ strategies:
       scan_interval_sec: 90
       min_liquidity_usd: 100.0
 
-  # ---- Kalshi strategies (same logic, different exchange) --------------
-  # These mirror the Polymarket strategies above but scan and trade on
-  # Kalshi's binary temperature markets instead of Polymarket's buckets.
-  # Enable once KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PATH are configured.
+  # ---- Kalshi strategies (active) --------------------------------------
+  # These use the same strategy classes as the dormant Polymarket entries,
+  # but scan and trade Kalshi's binary temperature markets.
   # Kalshi binary markets: each market is "Will HIGH temp be >= X°F?"
   # Lazy strategy: identical threshold logic (buy YES when price >= 0.60).
   - name: lazy
     enabled: true
     params:
       exchange: kalshi
-      thresholds: [0.60, 0.75]
+      cities: [Atlanta, NYC, Chicago, Dallas, Houston, Miami]
+      thresholds: [0.65, 0.75]
       claimed_edge_pct: 0.10
-      max_price: 0.95
+      max_price: 0.85
       min_hours_to_resolution: 12
       max_forecast_horizon_hours: 48
       scan_interval_sec: 90
@@ -283,7 +316,10 @@ strategies:
     params:
       exchange: kalshi
       cities: [Atlanta, NYC, Chicago, Dallas, Houston, Miami]
-      require_confirmed_resolution: false  # Kalshi has its own resolution registry
+      # Kalshi markets define city/date/threshold in the ticker. Forecasts
+      # still use the shared city station registry for lat/lon, but Kalshi is
+      # not blocked by Polymarket's confirmed-resolution gate.
+      require_confirmed_resolution: false
       forecast_models: [noaa, open_meteo_gfs, open_meteo_icon]
       forecast_model_weights:
         open_meteo_gfs: 0.366
@@ -301,6 +337,8 @@ strategies:
       min_bias_apply_f: 0.5
       min_agreement: 0.0
       min_edge_pct: 0.15
+      # Mirrors the Polymarket gate — see comment above.
+      min_model_prob: 0.20
       max_edge_sanity: 0.30
       min_hours_to_resolution: 12
       max_forecast_horizon_hours: 48

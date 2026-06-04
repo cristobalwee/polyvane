@@ -31,7 +31,7 @@ import aiohttp
 
 from strategies.base import BaseStrategy, Signal, StrategyContext, TradeIntent
 
-from . import resolution
+from . import kalshi_resolution, resolution
 from .ensemble import EnsembleForecaster, EnsembleResult
 from .markets import GammaClient
 from .models import Forecast, TemperatureBucket, WeatherMarket, WeatherSignal
@@ -84,6 +84,12 @@ class WeatherStrategy(BaseStrategy):
         self._min_edge: float = float(params.get("min_edge_pct", 0.15))
         self._adjacent_min_edge: float = float(params.get("adjacent_min_edge_pct", 0.10))
         self._trade_adjacent: bool = bool(params.get("trade_adjacent_buckets", True))
+        # Absolute floor on model_prob. Edge alone can be inflated by tiny
+        # YES prices on long-shot adjacent buckets — a 0.05 model_prob vs
+        # $0.005 price clears a 0.04 edge gate but has historically been a
+        # net loser (-$526 across 128 trades in the 2026-05-10..25 window).
+        # 0.20 matches the empirical cliff between losing and winning bins.
+        self._min_model_prob: float = float(params.get("min_model_prob", 0.20))
         # Sanity cap on claimed edge. A 30%+ edge in a liquid binary market is
         # almost always a model bug (probability inflation, sign error, bias
         # uncorrected) — not real alpha. We log loudly and skip.
@@ -207,13 +213,14 @@ class WeatherStrategy(BaseStrategy):
         )
         self.log.info(
             "WeatherStrategy ready: exchange=%s tradeable=%s skipped=%d models=%s min_edge=%.2f "
-            "adj_edge=%.2f min_agreement=%.2f bias_cities=%s",
+            "adj_edge=%.2f min_p=%.2f min_agreement=%.2f bias_cities=%s",
             self._exchange,
             sorted(self._tradeable_cities),
             len(self._skipped_cities),
             list(self._model_weights.keys()),
             self._min_edge,
             self._adjacent_min_edge,
+            self._min_model_prob,
             self._min_agreement,
             bias_cities,
         )
@@ -318,7 +325,7 @@ class WeatherStrategy(BaseStrategy):
                 skipped_window += 1
                 continue
 
-            src = resolution.get(m.city)
+            src = kalshi_resolution.get(m.city) or resolution.get(m.city)
             if src is None:
                 continue
 
@@ -390,6 +397,8 @@ class WeatherStrategy(BaseStrategy):
         bucket_role = signal.metadata.get("bucket_role", "primary")
         edge_floor = self._min_edge if bucket_role == "primary" else self._adjacent_min_edge
         if signal.edge < edge_floor:
+            return None
+        if signal.confidence < self._min_model_prob:
             return None
         if signal.edge > self._max_edge_sanity:
             self.log.warning(
