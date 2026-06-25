@@ -33,6 +33,24 @@ KALSHI_DEMO_BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
 KALSHI_LIVE_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
 
+def _parse_price_dollars_kalshi(*values: Any) -> float | None:
+    """First value parseable as a decimal-dollar price strictly in (0, 1).
+
+    Kalshi's 2026-06 schema reports prices as decimal-dollar strings under
+    ``*_dollars`` keys (e.g. ``"0.6700"``); 0.00/1.00 are no-offer sentinels.
+    """
+    for v in values:
+        if v is None or v == "":
+            continue
+        try:
+            p = float(v)
+        except (TypeError, ValueError):
+            continue
+        if 0.0 < p < 1.0:
+            return p
+    return None
+
+
 class KalshiTransientError(Exception):
     pass
 
@@ -253,37 +271,69 @@ class KalshiClient:
     async def get_orderbook(self, ticker: str, *, depth: int = 10) -> dict[str, Any]:
         return await self._get(f"/markets/{ticker}/orderbook", params={"depth": depth})
 
+    @staticmethod
+    def _best_book_price(levels: Any) -> float | None:
+        """Best (highest) price from one side of a Kalshi order book.
+
+        Handles both the 2026-06 ``*_dollars`` schema — a list of
+        ``[price_str, size_str]`` pairs in decimal dollars — and the legacy
+        ``[{"price": cents}]`` schema. Returns a price in (0, 1) or None.
+        """
+        if not levels:
+            return None
+        prices: list[float] = []
+        for lvl in levels:
+            try:
+                raw = lvl.get("price") if isinstance(lvl, dict) else lvl[0]
+                p = float(raw)
+            except (TypeError, ValueError, IndexError, KeyError):
+                continue
+            if p > 1.0:        # legacy integer cents
+                p /= 100.0
+            if 0.0 < p < 1.0:
+                prices.append(p)
+        return max(prices) if prices else None
+
+    def _market_last_price(self, market: dict[str, Any]) -> float | None:
+        """Best-effort last/ask price from a market object, new or old schema."""
+        return _parse_price_dollars_kalshi(
+            market.get("last_price_dollars"),
+            market.get("yes_ask_dollars"),
+        ) or (
+            self.cents_to_float(market.get("last_price") or market.get("yes_ask"))
+            if (market.get("last_price") or market.get("yes_ask")) else None
+        )
+
     async def get_midpoint(self, ticker: str) -> dict[str, float]:
         """Return {"mid": float} for compatibility with ClobClient.get_midpoint()."""
+        mid: float | None = None
         try:
             book = await self.get_orderbook(ticker, depth=1)
-            ob = book.get("orderbook") or book
-            bids = ob.get("yes", [])  # Kalshi YES bids (buy YES)
-            asks = ob.get("no", [])   # Kalshi NO asks (equivalent to YES asks)
-            best_bid = self.cents_to_float(bids[0]["price"]) if bids else None
-            # NO price in cents → YES ask = 100 - no_bid_cents
-            best_ask = self.cents_to_float(100 - asks[0]["price"]) if asks else None
+            ob = book.get("orderbook_fp") or book.get("orderbook") or book
+            yes_levels = ob.get("yes_dollars") or ob.get("yes") or []
+            no_levels = ob.get("no_dollars") or ob.get("no") or []
+            best_bid = self._best_book_price(yes_levels)         # best YES bid
+            best_no_bid = self._best_book_price(no_levels)       # best NO bid
+            best_ask = (1.0 - best_no_bid) if best_no_bid is not None else None  # → YES ask
             if best_bid is not None and best_ask is not None:
                 mid = (best_bid + best_ask) / 2.0
             elif best_bid is not None:
                 mid = best_bid
             elif best_ask is not None:
                 mid = best_ask
-            else:
-                # Fall back to last_price from market data
+            if mid is None:
+                # Empty book — fall back to last traded price.
                 mkt = await self.get_market(ticker)
-                market = mkt.get("market") or mkt
-                last = market.get("last_price") or market.get("yes_ask")
-                mid = self.cents_to_float(last) if last is not None else 0.5
+                mid = self._market_last_price(mkt.get("market") or mkt)
         except Exception:
             log.debug("KalshiClient.get_midpoint(%s) fallback to market fetch", ticker, exc_info=True)
             try:
                 mkt = await self.get_market(ticker)
-                market = mkt.get("market") or mkt
-                last = market.get("last_price") or market.get("yes_ask")
-                mid = self.cents_to_float(last) if last is not None else 0.5
+                mid = self._market_last_price(mkt.get("market") or mkt)
             except Exception:
-                mid = 0.5
+                mid = None
+        if mid is None:
+            mid = 0.5
         return {"mid": max(0.01, min(0.99, mid))}
 
     # ------------------------------------------------------------------

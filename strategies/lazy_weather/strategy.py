@@ -53,6 +53,13 @@ class LazyWeatherStrategy(BaseStrategy):
         self._max_hours: float = float(params.get("max_forecast_horizon_hours", 48.0))
         self._scan_interval_sec: float = float(params.get("scan_interval_sec", 300.0))
         self._min_liquidity: float = float(params.get("min_liquidity_usd", 100.0))
+        # Kalshi liquidity guard (Fix A). Kalshi doesn't expose USD liquidity,
+        # but it does expose traded volume and a two-sided book. Phantom
+        # $0.75 entries on zero-volume tail markets were the dominant loss
+        # source, so require real volume AND a tight, genuinely two-sided
+        # book (spread is None when the book was one-sided / stale).
+        self._min_volume_usd: float = float(params.get("min_volume_usd", 0.0))
+        self._max_spread: float = float(params.get("max_spread", 1.0))
         self._max_price: float = float(params.get("max_price", 0.95))
         self._request_timeout_sec: float = float(params.get("request_timeout_sec", 15.0))
         cities = params.get("cities") or []
@@ -230,12 +237,24 @@ class LazyWeatherStrategy(BaseStrategy):
         skipped_below_floor = 0
         skipped_max_price = 0
         skipped_already_fired = 0
+        skipped_illiquid = 0
 
         floor = self._thresholds[0]
         for m in markets:
             hours_to_end = (m.end_date_utc - now).total_seconds() / 3600.0
             if hours_to_end < self._min_hours or hours_to_end > self._max_hours:
                 skipped_window += 1
+                continue
+            # Liquidity guard (Fix A): only trade markets with a genuine,
+            # tight two-sided book and real traded volume. `spread is None`
+            # means the price came from a one-sided book or a stale last
+            # trade — no real price discovery, so the "crowd consensus"
+            # thesis doesn't hold.
+            if m.spread is None or m.spread > self._max_spread:
+                skipped_illiquid += 1
+                continue
+            if m.volume_usd < self._min_volume_usd:
+                skipped_illiquid += 1
                 continue
             if m.yes_price > self._max_price:
                 skipped_max_price += 1
@@ -266,9 +285,9 @@ class LazyWeatherStrategy(BaseStrategy):
 
         self.log.info(
             "lazy[kalshi] scan: %d markets total | %d candidate signals | "
-            "skipped: window=%d below_floor=%d max_price=%d already_fired=%d",
-            len(markets), candidates, skipped_window, skipped_below_floor,
-            skipped_max_price, skipped_already_fired,
+            "skipped: window=%d illiquid=%d below_floor=%d max_price=%d already_fired=%d",
+            len(markets), candidates, skipped_window, skipped_illiquid,
+            skipped_below_floor, skipped_max_price, skipped_already_fired,
         )
         return signals
 
@@ -289,7 +308,10 @@ class LazyWeatherStrategy(BaseStrategy):
                 "city": m.city,
                 "metric": m.metric,
                 "threshold_f": m.threshold_f,
+                "threshold_high_f": m.threshold_high,
+                "side": m.side,
                 "threshold_unit": "fahrenheit",
+                "spread": m.spread,
                 "end_utc": m.end_date_utc.isoformat(),
                 "volume_usd": m.volume_usd,
                 "ladder_threshold": threshold,

@@ -99,6 +99,11 @@ class WeatherStrategy(BaseStrategy):
         self._scan_interval_sec: float = float(params.get("scan_interval_sec", 300))
         self._scan_on_model_update: bool = bool(params.get("scan_on_model_update", True))
         self._min_liquidity: float = float(params.get("min_liquidity_usd", 100.0))
+        # Kalshi liquidity guard (Fix A) — see LazyWeatherStrategy. Reject
+        # markets without real volume and a tight two-sided book so we don't
+        # compute an edge against a phantom midpoint.
+        self._min_volume_usd: float = float(params.get("min_volume_usd", 0.0))
+        self._max_spread: float = float(params.get("max_spread", 1.0))
         self._request_timeout_sec: float = float(params.get("request_timeout_sec", 15.0))
         self._noaa_max_rps: float = float(params.get("noaa_max_rps", 5.0))
 
@@ -318,11 +323,17 @@ class WeatherStrategy(BaseStrategy):
         forecasts_fetched = 0
         skipped_window = 0
         skipped_edge = 0
+        skipped_illiquid = 0
 
         for m in markets:
             hours_to_end = (m.end_date_utc - now).total_seconds() / 3600.0
             if hours_to_end < self._min_hours or hours_to_end > self._max_horizon_hours:
                 skipped_window += 1
+                continue
+
+            # Liquidity guard (Fix A): no edge against a phantom midpoint.
+            if m.spread is None or m.spread > self._max_spread or m.volume_usd < self._min_volume_usd:
+                skipped_illiquid += 1
                 continue
 
             src = kalshi_resolution.get(m.city) or resolution.get(m.city)
@@ -346,10 +357,21 @@ class WeatherStrategy(BaseStrategy):
                 continue
             forecasts_fetched += len(forecasts)
 
-            # P(temp >= threshold_f) under the Gaussian mixture.
-            prob = self._ensemble.cdf_exceedance(
-                forecasts, m.threshold_f, city=m.city
-            )
+            # YES probability under the Gaussian mixture, respecting the
+            # market's DIRECTION (Fix B). cdf_exceedance gives P(temp >= X);
+            # "below" markets resolve YES on temp < X, and ranges on X<=temp<=Y.
+            # The old code used the exceedance for every market, inverting the
+            # edge sign for every "<" and range market.
+            exceed = self._ensemble.cdf_exceedance(forecasts, m.threshold_f, city=m.city)
+            if m.side == "below":
+                prob = 1.0 - exceed
+            elif m.side == "range" and m.threshold_high is not None:
+                exceed_high = self._ensemble.cdf_exceedance(
+                    forecasts, m.threshold_high, city=m.city
+                )
+                prob = max(0.0, exceed - exceed_high)
+            else:  # "above"
+                prob = exceed
             edge = prob - m.yes_price
 
             if abs(edge) < self._min_edge:
@@ -377,7 +399,10 @@ class WeatherStrategy(BaseStrategy):
                     "city": m.city,
                     "metric": m.metric,
                     "threshold_f": m.threshold_f,
+                    "threshold_high_f": m.threshold_high,
+                    "side": m.side,
                     "threshold_unit": "fahrenheit",
+                    "spread": m.spread,
                     "model_prob": prob,
                     "target_date": m.target_date.isoformat(),
                     "end_utc": m.end_date_utc.isoformat(),
@@ -388,8 +413,10 @@ class WeatherStrategy(BaseStrategy):
             ))
 
         self.log.info(
-            "scan[kalshi]: %d markets, %d forecasts, %d skipped(window), %d skipped(edge), %d signal(s)",
-            len(markets), forecasts_fetched, skipped_window, skipped_edge, len(signals),
+            "scan[kalshi]: %d markets, %d forecasts, %d skipped(window), "
+            "%d skipped(illiquid), %d skipped(edge), %d signal(s)",
+            len(markets), forecasts_fetched, skipped_window, skipped_illiquid,
+            skipped_edge, len(signals),
         )
         return signals
 

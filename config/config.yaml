@@ -304,10 +304,23 @@ strategies:
       thresholds: [0.65, 0.75]
       claimed_edge_pct: 0.10
       max_price: 0.85
-      min_hours_to_resolution: 12
+      # Lowered from 12 → 2 for Kalshi: daily weather thresholds only climb
+      # into the 0.65 entry band as the forecast firms up near expiry, and
+      # we can't yet prove that crossing happens before the 12h mark. A 2h
+      # floor lets the bot buy whenever the favorite enters [0.65, 0.85];
+      # max_price (0.85) still blocks the same-day near-locks (0.95+). Keep
+      # the 0.65 price floor — sub-0.60 entries are negative-EV here.
+      min_hours_to_resolution: 2
       max_forecast_horizon_hours: 48
       scan_interval_sec: 90
       min_liquidity_usd: 0       # Kalshi doesn't expose USD liquidity per-market
+      # Liquidity guard (Fix A). The phantom $0.75 entries were zero-volume
+      # tail markets with one-sided books: the bot bought the wide MM ask and
+      # the stop-loss exited at ~50% (54/54 resolved $0.75 trades lost). Now
+      # we price at the book midpoint and require BOTH real traded volume and
+      # a tight two-sided book (spread). Tune up once we see fill quality.
+      min_volume_usd: 50         # require genuine traded volume
+      max_spread: 0.10           # reject wide / one-sided books (no price discovery)
 
   # Weather strategy: uses forecast CDF (P(temp >= threshold)) vs Kalshi
   # YES price for edge; same ensemble models and bias corrections as above.
@@ -340,10 +353,17 @@ strategies:
       # Mirrors the Polymarket gate — see comment above.
       min_model_prob: 0.20
       max_edge_sanity: 0.30
-      min_hours_to_resolution: 12
+      # Lowered 12 → 2 (Fix C) to match lazy_kalshi: daily Kalshi temperature
+      # markets only price up near expiry, so a 12h floor skipped essentially
+      # every market — the strategy had ZERO trades. Safe only because the
+      # direction bug (P(temp>=X) applied to "<" / range markets) is now fixed.
+      min_hours_to_resolution: 2
       max_forecast_horizon_hours: 48
       scan_interval_sec: 300
       noaa_max_rps: 5.0
+      # Liquidity guard (Fix A) — don't compute an edge against a phantom mid.
+      min_volume_usd: 50
+      max_spread: 0.10
 
   # ---- Other strategies (still scaffolds — disabled) -------------------
   - name: arbitrage
