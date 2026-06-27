@@ -55,6 +55,16 @@ class KalshiTransientError(Exception):
     pass
 
 
+class KalshiInsufficientFundsError(Exception):
+    """Order rejected by Kalshi for insufficient account balance.
+
+    Distinct from a generic API error so the executor can skip retries (the
+    balance won't recover on its own) and pause trading instead of hammering
+    the API with orders that can't fill.
+    """
+    pass
+
+
 @dataclass
 class KalshiClientConfig:
     base_url: str
@@ -204,6 +214,13 @@ class KalshiClient:
                 if resp.status in (429, 502, 503, 504):
                     raise KalshiTransientError(f"HTTP {resp.status}: {text[:200]}")
                 if resp.status >= 400:
+                    # Kalshi reports insufficient balance as a 400 with an
+                    # `insufficient_balance` error code in the JSON body. Surface
+                    # it as a typed error so the executor stops retrying/placing.
+                    if "insufficient_balance" in text.lower():
+                        raise KalshiInsufficientFundsError(
+                            f"Kalshi rejected order — insufficient balance: {text[:300]}"
+                        )
                     raise RuntimeError(f"Kalshi API error {resp.status}: {text[:500]}")
                 if not text:
                     return {}
@@ -381,3 +398,17 @@ class KalshiClient:
         if not self._authenticated:
             raise RuntimeError("KalshiClient not authenticated")
         return await self._get("/portfolio/positions")
+
+    async def get_balance(self) -> float:
+        """Return available account balance in USD.
+
+        Kalshi's GET /portfolio/balance returns ``balance`` in integer cents
+        (the settled cash available for new orders). Requires auth.
+        """
+        if not self._authenticated:
+            raise RuntimeError("KalshiClient not authenticated")
+        data = await self._get("/portfolio/balance")
+        cents = data.get("balance") if isinstance(data, dict) else None
+        if cents is None:
+            raise RuntimeError(f"Kalshi balance response missing 'balance': {data!r}")
+        return float(cents) / 100.0

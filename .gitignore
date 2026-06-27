@@ -27,6 +27,7 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
+*.profraw
 
 # Virtual environments
 .venv/

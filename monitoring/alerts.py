@@ -507,6 +507,16 @@ def format_message(
             f"PnL: ${payload.get('realized_pnl_usd', 0.0):+.2f} / "
             f"-${payload.get('daily_loss_limit_usd', 0.0):.0f}"
         )
+    if event_type == "insufficient_funds":
+        # Account ran out of fundable balance — ping the operator; trading is
+        # paused until the balance recovers (top up, or positions resolve).
+        ping = f"<@{cfg.discord_user_id}> " if cfg.discord_user_id else ""
+        question = payload.get("market_question") or payload.get("market_id") or "?"
+        return (
+            f"{ping}💸 **Insufficient funds** [{payload.get('strategy')}] — "
+            f"order on `{question}` (${payload.get('size_usd', 0.0):.2f}) rejected. "
+            "Trading paused until balance recovers."
+        )
     if event_type == "error":
         return (
             f"❗ **Error** — {payload.get('source', 'bot')}: "

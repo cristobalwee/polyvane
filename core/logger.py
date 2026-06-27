@@ -151,6 +151,24 @@ class TradeJournal:
                     (outcome, pnl, json.dumps(_sanitize_for_json(merged), default=str), trade_id),
                 )
 
+    def void_entry(self, trade_id: int, *, reason: str) -> None:
+        """Mark a recorded entry as voided — the order was never actually placed.
+
+        `record_entry` writes the journal row BEFORE the live order is submitted,
+        so a rejected order (e.g. insufficient funds) would otherwise leave a
+        bogus `pending` row that gets counted as an open position by concurrency
+        caps and the stop-loss loop. Voiding excludes it from both (which filter
+        on `pending`/`won`/`lost`) while preserving an audit trail.
+        """
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT metadata_json FROM trades WHERE id = ?", (trade_id,)).fetchone()
+            merged = json.loads(row["metadata_json"]) if row else {}
+            merged["void_reason"] = reason
+            conn.execute(
+                "UPDATE trades SET outcome = 'voided', pnl = 0.0, metadata_json = ? WHERE id = ?",
+                (json.dumps(_sanitize_for_json(merged), default=str), trade_id),
+            )
+
     def open_positions(self) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
             rows = conn.execute("SELECT * FROM trades WHERE outcome = 'pending'").fetchall()

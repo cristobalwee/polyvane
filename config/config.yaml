@@ -13,18 +13,23 @@ risk:
   # Maximum NEW positions opened per UTC day across ALL strategies. This is
   # a global ceiling — for paper testing the per-strategy cap below is what
   # actually shapes behavior; this just keeps a runaway bot from filling the
-  # journal. Tighten for live (was 15 globally before paper-mode loosening).
-  max_daily_positions: 1000
-  # Maximum simultaneously open positions GLOBALLY. Acts as a bug-containment
-  # ceiling — see max_concurrent_positions_per_strategy below for the cap
-  # that actually matters in paper mode. Tighten to ~30-50 for live.
-  max_concurrent_positions: 1000
+  # journal. Tightened to 5 for the live $50 Kalshi run: at the $10 per-position
+  # cap, ~5 positions is the entire bankroll, and Kalshi weather markets resolve
+  # end-of-day so funds don't free up intraday. Scale up once validated.
+  max_daily_positions: 5
+  # Maximum simultaneously open positions GLOBALLY. At $10/position this is the
+  # bankroll ceiling for the $50 account — opening a 6th would need funds that
+  # aren't there. Bug-containment + balance ceiling in one.
+  max_concurrent_positions: 5
   # Per-strategy concurrent-position cap. Each strategy gets its own slot
   # pool, so strategies don't starve each other when they fire signals
-  # near-simultaneously. Loose for paper; tighten to ~10-20 for live.
-  max_concurrent_positions_per_strategy: 200
+  # near-simultaneously. Matches the global cap for the single-live-strategy
+  # ($50) run; raise back to ~10-20 once trading more strategies live.
+  max_concurrent_positions_per_strategy: 5
   # Daily realized-loss circuit breaker. Hitting this halts ALL trading.
-  max_daily_loss_usd: 50.0
+  # Set to $20 for the $50 account (~40% drawdown) — a real stop, not the
+  # whole-bankroll non-breaker that $50 was. Raise as the bankroll grows.
+  max_daily_loss_usd: 20.0
   # Maximum exposure to any single market category as a fraction of total deployed capital.
   # NOTE: in paper-mode multi-strategy testing, all variants trade weather markets,
   # so a 30% cap blocks every trade ("category would be 100% of book"). Setting to

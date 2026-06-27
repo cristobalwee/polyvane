@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from core.client import ClobClient
+from core.kalshi_client import KalshiInsufficientFundsError
 # Side-effect import: registers the TRADE log level + .trade() helper.
 from core.logging_config import TRADE_LEVEL  # noqa: F401
 from core.logger import TradeJournal, TradeRecord
@@ -123,9 +124,16 @@ class Executor:
         self.client = client
         self.clients: dict[str, Any] = clients or {"polymarket": client}
         self._alert_hook: Any = None
+        self._pause_hook: Any = None
 
     def set_alert_hook(self, hook: Any) -> None:
         self._alert_hook = hook
+
+    def set_pause_hook(self, hook: Any) -> None:
+        """Register a callback invoked when trading should halt (e.g. the
+        account ran out of funds mid-scan). Wired by main.py to flip the
+        HealthMonitor's balance-pause flag, which every strategy loop honors."""
+        self._pause_hook = hook
 
     def _client_for(self, exchange: str) -> Any:
         return self.clients.get(exchange, self.client)
@@ -316,6 +324,32 @@ class Executor:
                 responses = await self._place_kalshi_order(intent, size_usd)
             else:
                 responses = await self._place_live_orders(intent, size_usd, neg_risk=neg_risk)
+        except KalshiInsufficientFundsError as e:
+            # The order was rejected — Kalshi placed nothing — so the journal row
+            # written above is bogus. Void it (otherwise it counts as an open
+            # position) and halt trading rather than retrying an order the
+            # account can't fund.
+            self.journal.void_entry(trade_id, reason="insufficient_funds")
+            log.error(
+                "TRADE_REJECTED | market=%s | exchange=%s | reason=insufficient_funds | error=%r",
+                sig.market_id, exchange, e,
+            )
+            self._emit("insufficient_funds", {
+                "strategy": record.strategy,
+                "market_id": sig.market_id,
+                "market_question": sig.market_question,
+                "size_usd": size_usd,
+            })
+            if self._pause_hook is not None:
+                try:
+                    self._pause_hook("insufficient_funds")
+                except Exception:
+                    log.debug("pause hook raised", exc_info=True)
+            return ExecutionResult(
+                accepted=False,
+                trade_id=trade_id,
+                reason="insufficient_funds",
+            )
         except Exception as e:
             log.exception(
                 "TRADE_REJECTED | market=%s | exchange=%s | reason=order_error | error=%r",
@@ -398,6 +432,10 @@ class Executor:
                     side, ticker, adj_cents, count,
                 )
                 return [resp]
+            except KalshiInsufficientFundsError:
+                # Won't recover by retrying — bubble up immediately so submit()
+                # can void the entry and pause trading.
+                raise
             except Exception:
                 attempt += 1
                 if attempt >= self.config.max_order_retries:

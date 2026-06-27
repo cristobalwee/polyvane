@@ -688,11 +688,21 @@ async def run(config_path: Path) -> int:
     alert_cfg = AlertConfig.from_dict(alerts_dict)
     alerts = AlertBus(alert_cfg)
 
+    # Balance source for the low-funds pause. Prefer the live Kalshi account
+    # balance (this deployment is Kalshi-first); fall back to the Polymarket
+    # pUSD wallet when that's the live exchange instead.
+    if kalshi_client is not None and kalshi_client.is_authenticated and kalshi_mode == "live":
+        balance_provider = kalshi_client.get_balance
+    elif wallet.is_initialized:
+        balance_provider = wallet.get_pusd_balance
+    else:
+        balance_provider = None
+
     health_cfg = HealthConfig.from_dict(monitoring_cfg.get("health"))
     health = HealthMonitor(
         health_cfg,
         alert_hook=alerts.emit,
-        wallet_balance_provider=(wallet.get_pusd_balance if wallet.is_initialized else None),
+        wallet_balance_provider=balance_provider,
         is_paper_mode=all_exchanges_paper,
     )
 
@@ -711,6 +721,14 @@ async def run(config_path: Path) -> int:
     risk.set_alert_hook(alerts.emit)
     executor.set_alert_hook(alerts.emit)
     stop_loss.set_alert_hook(alerts.emit)
+
+    # If an order is rejected for insufficient funds mid-scan (a race the
+    # 60s balance poll can miss), pause trading immediately. The next health
+    # cycle re-reads the balance and clears the flag if funds recovered.
+    def _pause_for_funds(_reason: str) -> None:
+        health.trading_paused_for_balance = True
+        log.warning("Trading paused — Kalshi reported insufficient funds on an order")
+    executor.set_pause_hook(_pause_for_funds)
 
     market_cache_ttl = float(cfg.get("market_cache", {}).get("default_ttl_sec", 30.0))
     market_cache = MarketCache(default_ttl_sec=market_cache_ttl)
@@ -738,6 +756,25 @@ async def run(config_path: Path) -> int:
         )
 
     async def bankroll_provider(strategy_name: str) -> float:
+        # Live Kalshi strategies size off the real account balance rather than
+        # the paper pool. is_paper_for_strategy("kalshi", name) is False only
+        # when kalshi_mode is live AND the strategy is on the live allowlist,
+        # so paper/Polymarket strategies fall through to the branches below.
+        if (
+            kalshi_client is not None
+            and kalshi_client.is_authenticated
+            and not exec_cfg.is_paper_for_strategy("kalshi", strategy_name)
+        ):
+            try:
+                balance = await kalshi_client.get_balance()
+                log.info("HEALTH_KALSHI | balance=$%.2f | strategy=%s", balance, strategy_name)
+                return balance
+            except Exception:
+                log.exception(
+                    "Failed to read Kalshi balance for %s; falling back to paper bankroll",
+                    strategy_name,
+                )
+                return paper_bankroll_per_strategy.get(strategy_name, paper_bankroll_default)
         if exec_cfg.is_paper or not wallet.is_initialized:
             return paper_bankroll_per_strategy.get(strategy_name, paper_bankroll_default)
         try:
