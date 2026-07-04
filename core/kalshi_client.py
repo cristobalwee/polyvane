@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -111,6 +112,42 @@ class KalshiClient:
         self._rsa_key: Any = None  # Crypto.PublicKey.RSA key object
         self._initialized = False
         self._authenticated = False
+        self._alert_hook: Any = None
+
+    def set_alert_hook(self, hook: Any) -> None:
+        """Register a callback (event_type, payload) invoked when Kalshi rejects
+        a request. Wired by main.py to the AlertBus so an API contract change
+        (moved endpoint, changed request/response shape, changed auth) fires an
+        operator alert instead of silently cascading into failed trades."""
+        self._alert_hook = hook
+
+    def _emit_api_error(self, method: str, path: str, status: int, text: str) -> None:
+        hook = self._alert_hook
+        if hook is None:
+            return
+        code = ""
+        try:
+            body = json.loads(text)
+            err = body.get("error") if isinstance(body, dict) else None
+            if isinstance(err, dict):
+                code = str(err.get("code") or "")
+        except (ValueError, TypeError, AttributeError):
+            pass
+        try:
+            hook("api_error", {
+                "source": "kalshi",
+                "status": status,
+                "code": code,
+                "method": method.upper(),
+                "path": path,
+                "message": text[:200],
+                # Bucket the cooldown by error class so a repeating rejection
+                # alerts once per window, but a *different* error (e.g. a new
+                # 400 after a 401) still gets through.
+                "cooldown_key": f"kalshi:{status}:{code}",
+            })
+        except Exception:
+            log.debug("api_error alert hook raised", exc_info=True)
 
     @property
     def is_initialized(self) -> bool:
@@ -237,10 +274,16 @@ class KalshiClient:
                     # Kalshi reports insufficient balance as a 400 with an
                     # `insufficient_balance` error code in the JSON body. Surface
                     # it as a typed error so the executor stops retrying/placing.
+                    # (It has its own operator alert; don't double-fire here.)
                     if "insufficient_balance" in text.lower():
                         raise KalshiInsufficientFundsError(
                             f"Kalshi rejected order — insufficient balance: {text[:300]}"
                         )
+                    # Any other non-transient rejection (400/401/403/404/410/…)
+                    # means the request was well-formed enough to reach Kalshi
+                    # but got refused — the signature of an API contract change.
+                    # Alert the operator before raising so it's loud, not silent.
+                    self._emit_api_error(method, path, resp.status, text)
                     raise RuntimeError(f"Kalshi API error {resp.status}: {text[:500]}")
                 if not text:
                     return {}
@@ -399,22 +442,29 @@ class KalshiClient:
           * ``side="bid"`` — buy YES (open/increase a YES long).
           * ``side="ask"`` — sell YES (close a YES long).
 
-        ``price`` is in **decimal dollars** (0 < price < 1), not cents.
-        ``count`` and ``price`` are sent as fixed-point strings. The response
-        (HTTP 201) reports ``fill_count`` / ``remaining_count`` /
-        ``average_fill_price`` so the caller can reconcile against actual fills.
+        ``price`` is in **decimal dollars** (0 < price < 1), not cents. Kalshi's
+        binary (weather) markets tick in whole cents, so the price is snapped to
+        the nearest cent and sent with 2-decimal precision — sending more
+        precision (e.g. "0.653250") is rejected with 400 ``invalid_order``
+        ("invalid dollar precision"). ``count`` and ``price`` are sent as
+        fixed-point strings. The response (HTTP 201) reports ``fill_count`` /
+        ``remaining_count`` / ``average_fill_price`` so the caller can reconcile
+        against actual fills.
         """
         if not self._authenticated:
             raise RuntimeError("KalshiClient not authenticated — cannot place orders")
         if side not in ("bid", "ask"):
             raise ValueError(f"Kalshi V2 order side must be 'bid' or 'ask', got {side!r}")
-        if not (0.0 < price < 1.0):
-            raise ValueError(f"Kalshi order price must be in (0, 1) dollars, got {price!r}")
+        # Snap to whole cents (the tick size for binary markets) and validate
+        # the resulting 1..99¢ range.
+        price_cents = round(price * 100)
+        if not (1 <= price_cents <= 99):
+            raise ValueError(f"Kalshi order price must be in 1..99¢, got {price!r}")
         body: dict[str, Any] = {
             "ticker": ticker,
             "side": side,
             "count": str(int(count)),
-            "price": f"{price:.6f}",
+            "price": f"{price_cents / 100:.2f}",
             "time_in_force": time_in_force,
             "self_trade_prevention_type": self_trade_prevention_type,
         }

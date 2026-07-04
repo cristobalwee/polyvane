@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import uuid
 from typing import Any, TYPE_CHECKING
 
@@ -258,7 +259,10 @@ class StopLossManager:
             # Entries are YES-only (see executor); a NO position shouldn't exist.
             raise RuntimeError(f"Kalshi V2 stop-loss only closes YES positions, got {direction!r}")
 
-        limit_price = max(0.01, min(0.99, current_price * 0.99))  # cross down to fill
+        # Cross down to fill, then round DOWN to a whole cent (binary markets
+        # tick in cents; sub-cent prices are rejected). Floor keeps the exit
+        # marketable after the snap.
+        limit_price = min(0.99, max(0.01, math.floor(current_price * 0.99 * 100) / 100.0))
         count = max(1, int(shares))
 
         await client.create_order(

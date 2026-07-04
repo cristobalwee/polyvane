@@ -721,6 +721,10 @@ async def run(config_path: Path) -> int:
     risk.set_alert_hook(alerts.emit)
     executor.set_alert_hook(alerts.emit)
     stop_loss.set_alert_hook(alerts.emit)
+    # Alert on any Kalshi API rejection (moved endpoint / changed shape / auth)
+    # so a contract change is loud instead of cascading into failed trades.
+    if kalshi_client is not None:
+        kalshi_client.set_alert_hook(alerts.emit)
 
     # If an order is rejected for insufficient funds mid-scan (a race the
     # 60s balance poll can miss), pause trading immediately. The next health

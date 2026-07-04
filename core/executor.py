@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -450,9 +451,13 @@ class Executor:
         if not client.is_authenticated:
             raise RuntimeError("Kalshi client not authenticated; cannot place live orders")
 
-        # Cross the spread so the FOK fills: pay up to slightly ABOVE the signal.
+        # Cross the spread so the FOK fills: pay up to slightly ABOVE the signal,
+        # then round UP to the next whole cent (Kalshi binary markets tick in
+        # cents; the client rejects sub-cent prices). Ceiling — not nearest —
+        # keeps the order marketable after the snap.
         offset = self.config.limit_offset_pct
-        limit_price = max(0.01, min(0.99, sig.price * (1.0 + offset)))
+        raw_price = sig.price * (1.0 + offset)
+        limit_price = min(0.99, max(0.01, math.ceil(raw_price * 100) / 100.0))
 
         # Contracts affordable at the limit price (each costs `limit_price` USD).
         count = max(1, int(size_usd / limit_price))

@@ -38,6 +38,7 @@ EVENT_TYPES = (
     "drawdown_warning",
     "circuit_breaker",
     "error",
+    "api_error",
     "new_city_detected",
     "health_warning",
     "stop_loss_triggered",
@@ -133,12 +134,19 @@ class AlertBus:
         if event_type == "new_city_detected" and not self.config.new_city_notifications:
             return
         # Per-event-type cooldown; circuit_breaker bypasses (always alert).
+        # A caller may pass an explicit `cooldown_key` in the payload to bucket
+        # distinct conditions independently (e.g. api_error keys by
+        # status+code so a 401 and a 410 each alert, but repeats are throttled).
         # For trade_executed, bucket by exchange so Polymarket and Kalshi
         # notifications don't suppress each other.
         if event_type != "circuit_breaker":
             now = time.monotonic()
-            exchange = payload.get("metadata", {}).get("exchange") if event_type == "trade_executed" else None
-            cooldown_key = f"{event_type}:{exchange}" if exchange else event_type
+            explicit_key = payload.get("cooldown_key")
+            if explicit_key:
+                cooldown_key = f"{event_type}:{explicit_key}"
+            else:
+                exchange = payload.get("metadata", {}).get("exchange") if event_type == "trade_executed" else None
+                cooldown_key = f"{event_type}:{exchange}" if exchange else event_type
             last = self._last_emit_at.get(cooldown_key, 0.0)
             if now - last < self.config.alert_cooldown_sec:
                 return
@@ -523,6 +531,29 @@ def format_message(
             f"{payload.get('message', 'see logs')} "
             f"(count={payload.get('count', 1)})"
         )
+    if event_type == "api_error":
+        # An exchange rejected a request — almost always an API contract change
+        # (endpoint moved, request/response shape changed, auth scheme changed).
+        # This is the "the integration silently broke" alarm, so ping the
+        # operator: trading is impaired until it's fixed.
+        ping = f"<@{cfg.discord_user_id}> " if cfg.discord_user_id else ""
+        src = payload.get("source", "api")
+        status = payload.get("status", "?")
+        code = payload.get("code") or "?"
+        method = payload.get("method", "?")
+        path = payload.get("path", "?")
+        detail = (payload.get("message") or "").strip()
+        lines = [
+            f"{ping}🚨 **API rejected** [{src}] — HTTP {status} `{code}`",
+            f"`{method} {path}`",
+        ]
+        if detail:
+            lines.append(detail)
+        lines.append(
+            "Likely an API contract change (endpoint/shape/auth). "
+            "Trading on this exchange is impaired until fixed."
+        )
+        return "\n".join(lines)
     if event_type == "new_city_detected":
         return (
             f"🌍 **New city detected** — `{payload.get('city')}` not in resolution "
