@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from typing import Any, TYPE_CHECKING
 
 from core.logger import TradeJournal
@@ -242,23 +243,29 @@ class StopLossManager:
         current_price: float,
         shares: float,
     ) -> None:
-        """Place a Kalshi exit order (sell YES or buy NO to close the position)."""
+        """Place a Kalshi exit order to close a YES position (V2 endpoint).
+
+        Closing a YES long = selling YES = a ``side="ask"`` order. We price it
+        slightly BELOW the current mark and use immediate-or-cancel so we take
+        whatever exit liquidity exists right now rather than resting (a stop-out
+        should get out, even partially, not sit unfilled)."""
         client = self._client_for("kalshi")
         if not client.is_authenticated:
             raise RuntimeError("Kalshi client not authenticated; cannot place stop-loss order")
 
         direction = pos.get("direction", "YES")
-        # To exit a YES position: sell YES contracts back.
-        # To exit a NO position: sell NO contracts back.
-        side = "yes" if direction == "YES" else "no"
-        yes_price_cents = client.float_to_cents(current_price * 0.99)  # slight offset
+        if direction != "YES":
+            # Entries are YES-only (see executor); a NO position shouldn't exist.
+            raise RuntimeError(f"Kalshi V2 stop-loss only closes YES positions, got {direction!r}")
+
+        limit_price = max(0.01, min(0.99, current_price * 0.99))  # cross down to fill
         count = max(1, int(shares))
 
         await client.create_order(
             ticker=ticker,
-            side=side,
+            side="ask",
             count=count,
-            action="sell",
-            yes_price=yes_price_cents if side == "yes" else None,
-            no_price=(100 - yes_price_cents) if side == "no" else None,
+            price=limit_price,
+            time_in_force="immediate_or_cancel",
+            client_order_id=uuid.uuid4().hex,
         )

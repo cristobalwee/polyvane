@@ -151,6 +151,27 @@ class TradeJournal:
                     (outcome, pnl, json.dumps(_sanitize_for_json(merged), default=str), trade_id),
                 )
 
+    def update_entry_fill(
+        self,
+        trade_id: int,
+        *,
+        entry_price: float,
+        shares: float,
+        size_usd: float,
+    ) -> None:
+        """Reconcile a recorded entry to the actual fill.
+
+        `record_entry` writes the row using the strategy's intended price/size
+        BEFORE the order is placed. Once the exchange reports the real fill
+        (Kalshi V2 returns fill_count + average_fill_price), true up the row so
+        PnL, stop-loss marks, and stats reflect what actually executed.
+        """
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE trades SET entry_price = ?, shares = ?, size_usd = ? WHERE id = ?",
+                (entry_price, shares, size_usd, trade_id),
+            )
+
     def void_entry(self, trade_id: int, *, reason: str) -> None:
         """Mark a recorded entry as voided — the order was never actually placed.
 

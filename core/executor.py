@@ -20,11 +20,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
 from core.client import ClobClient
-from core.kalshi_client import KalshiInsufficientFundsError
+from core.kalshi_client import KalshiInsufficientFundsError, parse_kalshi_number
 # Side-effect import: registers the TRADE log level + .trade() helper.
 from core.logging_config import TRADE_LEVEL  # noqa: F401
 from core.logger import TradeJournal, TradeRecord
@@ -351,6 +352,12 @@ class Executor:
                 reason="insufficient_funds",
             )
         except Exception as e:
+            # The order attempt failed — nothing was placed on the exchange, so
+            # the journal row written above is bogus. Void it; otherwise it
+            # lingers as a phantom `pending` position that the resolution
+            # reviewer later settles into a fake win/loss (this is what made a
+            # dead v1 endpoint look like a stream of losing live trades).
+            self.journal.void_entry(trade_id, reason="order_error")
             log.exception(
                 "TRADE_REJECTED | market=%s | exchange=%s | reason=order_error | error=%r",
                 sig.market_id, exchange, e,
@@ -360,6 +367,34 @@ class Executor:
                 trade_id=trade_id,
                 reason=f"order_error: {e}",
             )
+
+        # Kalshi fill reconciliation. A fill-or-kill either fills fully or is
+        # canceled (HTTP 201 with fill_count=0) — no exception in the latter
+        # case. Void unfilled entries and true up filled ones to the actual
+        # count / average price so the journal mirrors the real account.
+        if exchange == "kalshi":
+            resp0 = responses[0] if responses else {}
+            fill_count = parse_kalshi_number(
+                resp0.get("fill_count") if isinstance(resp0, dict) else None
+            )
+            if not fill_count or fill_count <= 0:
+                self.journal.void_entry(trade_id, reason="unfilled")
+                log.trade(
+                    "TRADE_UNFILLED | market=%s | exchange=kalshi | bucket=%s | price=$%.4f | voided trade_id=%d",
+                    sig.market_id, bucket, sig.price, trade_id,
+                )
+                return ExecutionResult(accepted=False, trade_id=trade_id, reason="unfilled")
+            avg_price = parse_kalshi_number(
+                resp0.get("average_fill_price") if isinstance(resp0, dict) else None
+            ) or sig.price
+            filled_usd = fill_count * avg_price
+            self.journal.update_entry_fill(
+                trade_id,
+                entry_price=avg_price,
+                shares=fill_count,
+                size_usd=filled_usd,
+            )
+            size_usd = filled_usd
 
         for resp in responses:
             order_id = (
@@ -392,44 +427,54 @@ class Executor:
         intent: TradeIntent,
         size_usd: float,
     ) -> list[Any]:
-        """Place a limit order on Kalshi for the given intent."""
+        """Place a fill-or-kill YES buy on Kalshi (V2 order endpoint).
+
+        Kalshi's V2 book is expressed on the YES leg: a buy is a ``bid``. To
+        make the fill-or-kill actually fill we price it slightly ABOVE the
+        signal price (cross the spread) rather than inside the book — a resting
+        buy below the ask never fills, which is what produced phantom journal
+        positions under the old code.
+        """
         sig = intent.signal
         ticker = sig.token_id
         if not ticker:
             raise RuntimeError("Kalshi live mode requires signal.token_id (ticker)")
+        if sig.direction != "YES":
+            # Strategies only ever buy YES. NO-side entries have no unambiguous
+            # V2 mapping (buying NO ≠ selling YES when opening), so fail loud
+            # rather than risk placing an inverted bet with real money.
+            raise RuntimeError(f"Kalshi V2 orders only support YES entries, got {sig.direction!r}")
         client = self._client_for("kalshi")
         if not client.is_initialized:
             raise RuntimeError("Kalshi client not initialized")
         if not client.is_authenticated:
             raise RuntimeError("Kalshi client not authenticated; cannot place live orders")
 
-        yes_price_cents = client.float_to_cents(sig.price)
-        if yes_price_cents <= 0:
-            raise RuntimeError(f"Invalid Kalshi price: {sig.price}")
-
-        # Contract count: how many YES contracts at yes_price_cents each fit in size_usd.
-        # Each contract costs yes_price_cents / 100 USD.
-        count = max(1, int(size_usd * 100 / yes_price_cents))
-        side = "yes" if sig.direction == "YES" else "no"
-
-        # Apply the same limit offset as Polymarket orders (slightly inside market).
+        # Cross the spread so the FOK fills: pay up to slightly ABOVE the signal.
         offset = self.config.limit_offset_pct
-        adjusted_price = sig.price * (1.0 - offset) if sig.direction == "YES" else sig.price * (1.0 + offset)
-        adj_cents = client.float_to_cents(adjusted_price)
+        limit_price = max(0.01, min(0.99, sig.price * (1.0 + offset)))
+
+        # Contracts affordable at the limit price (each costs `limit_price` USD).
+        count = max(1, int(size_usd / limit_price))
+
+        # Stable per-order id so a retry after a transient failure is idempotent
+        # (Kalshi dedupes on client_order_id) rather than double-filling.
+        client_order_id = uuid.uuid4().hex
 
         attempt = 0
         while True:
             try:
                 resp = await client.create_order(
                     ticker=ticker,
-                    side=side,
+                    side="bid",
                     count=count,
-                    yes_price=adj_cents if side == "yes" else None,
-                    no_price=(100 - adj_cents) if side == "no" else None,
+                    price=limit_price,
+                    time_in_force="fill_or_kill",
+                    client_order_id=client_order_id,
                 )
                 log.info(
-                    "Kalshi order posted: %s %s @ %d¢ count=%d",
-                    side, ticker, adj_cents, count,
+                    "Kalshi order posted: bid %s @ $%.4f count=%d coid=%s",
+                    ticker, limit_price, count, client_order_id,
                 )
                 return [resp]
             except KalshiInsufficientFundsError:

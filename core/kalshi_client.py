@@ -51,6 +51,20 @@ def _parse_price_dollars_kalshi(*values: Any) -> float | None:
     return None
 
 
+def parse_kalshi_number(value: Any) -> float | None:
+    """Parse a Kalshi fixed-point field (returned as a string) to float.
+
+    V2 order responses report ``count`` / ``fill_count`` / ``average_fill_price``
+    as decimal strings. Returns None for missing/unparseable values.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class KalshiTransientError(Exception):
     pass
 
@@ -166,20 +180,26 @@ class KalshiClient:
             return {}
         try:
             from Crypto.Hash import SHA256  # type: ignore
-            from Crypto.Signature import pkcs1_15  # type: ignore
+            from Crypto.Signature import pss  # type: ignore
         except ImportError as exc:
             raise RuntimeError("pycryptodome required for request signing") from exc
         ts_ms = str(int(time.time() * 1000))
         # Kalshi signs the FULL request path, including the API prefix that
-        # lives in base_url (e.g. "/trade-api/v2"). Signing only the bare
-        # endpoint path ("/markets") yields a 401 "missing or invalid
-        # signature". Derive the prefix from base_url so this stays correct
-        # regardless of host/version.
+        # lives in base_url (e.g. "/trade-api/v2") but EXCLUDING the query
+        # string. Signing only the bare endpoint path ("/markets") yields a 401
+        # "missing or invalid signature". Derive the prefix from base_url so
+        # this stays correct regardless of host/version.
         base_path = urlparse(self.config.base_url).path.rstrip("/")
         full_path = f"{base_path}{path}"
         message = f"{ts_ms}{method.upper()}{full_path}"
         h = SHA256.new(message.encode("utf-8"))
-        sig = pkcs1_15.new(self._rsa_key).sign(h)
+        # Kalshi requires RSA-PSS (SHA-256, MGF1-SHA256, salt length = digest
+        # length = 32 bytes), NOT PKCS#1 v1.5. PKCS#1 v1.5 signatures are
+        # rejected with 401 INCORRECT_API_KEY_SIGNATURE on every authenticated
+        # endpoint (public reads don't enforce auth, which is why they worked).
+        # pycryptodome's PSS defaults to a *maximized* salt, so pin salt_bytes
+        # to the digest size to match Kalshi's spec.
+        sig = pss.new(self._rsa_key, salt_bytes=h.digest_size).sign(h)
         return {
             "KALSHI-ACCESS-KEY": self.config.key_id,
             "KALSHI-ACCESS-TIMESTAMP": ts_ms,
@@ -362,32 +382,47 @@ class KalshiClient:
         ticker: str,
         side: str,
         count: int,
+        price: float,
         *,
-        action: str = "buy",
-        yes_price: int | None = None,
-        no_price: int | None = None,
-        order_type: str = "limit",
-        expiration_ts: int | None = None,
+        time_in_force: str = "fill_or_kill",
+        self_trade_prevention_type: str = "taker_at_cross",
+        client_order_id: str | None = None,
+        post_only: bool = False,
     ) -> dict[str, Any]:
+        """Place an order on Kalshi's V2 order endpoint.
+
+        The legacy ``POST /portfolio/orders`` (side=yes/no + action=buy/sell +
+        integer-cent prices) was retired — it now returns HTTP 410
+        ``deprecated_v1_order_endpoint``. The V2 model expresses everything on
+        the YES leg of the book:
+
+          * ``side="bid"`` — buy YES (open/increase a YES long).
+          * ``side="ask"`` — sell YES (close a YES long).
+
+        ``price`` is in **decimal dollars** (0 < price < 1), not cents.
+        ``count`` and ``price`` are sent as fixed-point strings. The response
+        (HTTP 201) reports ``fill_count`` / ``remaining_count`` /
+        ``average_fill_price`` so the caller can reconcile against actual fills.
+        """
         if not self._authenticated:
             raise RuntimeError("KalshiClient not authenticated — cannot place orders")
-        action = action.lower()
-        if action not in ("buy", "sell"):
-            raise ValueError(f"Kalshi order action must be 'buy' or 'sell', got {action!r}")
+        if side not in ("bid", "ask"):
+            raise ValueError(f"Kalshi V2 order side must be 'bid' or 'ask', got {side!r}")
+        if not (0.0 < price < 1.0):
+            raise ValueError(f"Kalshi order price must be in (0, 1) dollars, got {price!r}")
         body: dict[str, Any] = {
             "ticker": ticker,
-            "action": action,
             "side": side,
-            "count": count,
-            "type": order_type,
+            "count": str(int(count)),
+            "price": f"{price:.6f}",
+            "time_in_force": time_in_force,
+            "self_trade_prevention_type": self_trade_prevention_type,
         }
-        if yes_price is not None:
-            body["yes_price"] = yes_price
-        if no_price is not None:
-            body["no_price"] = no_price
-        if expiration_ts is not None:
-            body["expiration_ts"] = expiration_ts
-        return await self._post("/portfolio/orders", body=body)
+        if client_order_id is not None:
+            body["client_order_id"] = client_order_id
+        if post_only:
+            body["post_only"] = True
+        return await self._post("/portfolio/events/orders", body=body)
 
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
         if not self._authenticated:
