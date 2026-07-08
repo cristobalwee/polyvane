@@ -6,30 +6,35 @@ risk:
   kelly_fraction: 0.25
   # Hard global ceiling on any single position in USD. Volume tiers below
   # narrow this further per-market; whichever is tighter wins.
-  # Tightened to $10 for the first live Kalshi (lazy_kalshi) run — guarantees
-  # every live order is <= $10 regardless of volume tier. Scale back up once
-  # the live rollout is validated.
-  max_position_usd: 10.0
+  # Raised $10 → $15 (2026-07-07) alongside funding the account past the
+  # initial $50 — the low volume tier below must move in lockstep, since
+  # every Kalshi weather market is < $50k volume and lands in that tier.
+  max_position_usd: 15.0
+  # Skip any trade whose Kelly-computed size lands below this. Kelly sizes
+  # off available CASH, so once a few slots are open the leftover produces
+  # dust orders ($0.68 entries) that burn daily/concurrent slots for
+  # negligible payoff. The trade is skipped, never bumped up to the floor.
+  min_position_usd: 5.0
   # Maximum NEW positions opened per UTC day across ALL strategies. This is
   # a global ceiling — for paper testing the per-strategy cap below is what
   # actually shapes behavior; this just keeps a runaway bot from filling the
   # journal. Tightened to 5 for the live $50 Kalshi run: at the $10 per-position
   # cap, ~5 positions is the entire bankroll, and Kalshi weather markets resolve
   # end-of-day so funds don't free up intraday. Scale up once validated.
-  max_daily_positions: 5
+  max_daily_positions: 10
   # Maximum simultaneously open positions GLOBALLY. At $10/position this is the
   # bankroll ceiling for the $50 account — opening a 6th would need funds that
   # aren't there. Bug-containment + balance ceiling in one.
-  max_concurrent_positions: 5
+  max_concurrent_positions: 10
   # Per-strategy concurrent-position cap. Each strategy gets its own slot
   # pool, so strategies don't starve each other when they fire signals
   # near-simultaneously. Matches the global cap for the single-live-strategy
   # ($50) run; raise back to ~10-20 once trading more strategies live.
-  max_concurrent_positions_per_strategy: 5
+  max_concurrent_positions_per_strategy: 10
   # Daily realized-loss circuit breaker. Hitting this halts ALL trading.
   # Set to $20 for the $50 account (~40% drawdown) — a real stop, not the
   # whole-bankroll non-breaker that $50 was. Raise as the bankroll grows.
-  max_daily_loss_usd: 20.0
+  max_daily_loss_usd: 30.0
   # Maximum exposure to any single market category as a fraction of total deployed capital.
   # NOTE: in paper-mode multi-strategy testing, all variants trade weather markets,
   # so a 30% cap blocks every trade ("category would be 100% of book"). Setting to
@@ -49,7 +54,10 @@ risk:
     - name: low
       min_volume_usd: 0
       max_volume_usd: 50000
-      max_position_usd: 10.0
+      # Kept equal to the global max_position_usd: ALL Kalshi weather
+      # markets fall in this tier, so a lower value here silently re-caps
+      # every live trade regardless of the global setting.
+      max_position_usd: 15.0
     - name: mid
       min_volume_usd: 50000
       max_volume_usd: 200000
@@ -75,7 +83,7 @@ execution:
   # Staged for live: flip to `live` once paper validation looks good. While
   # this is `paper`, ALL Kalshi strategies are paper regardless of the
   # allowlist below (is_paper_for() short-circuits).
-  kalshi_mode: paper
+  kalshi_mode: live
   # Per-strategy live allowlist. ONLY these strategy instance names submit
   # live orders; every other strategy stays in paper even on a live exchange.
   # Inert while kalshi_mode is paper. The default live allowlist is Kalshi-only.
@@ -92,6 +100,11 @@ execution:
   # Per-order retry configuration on transient failures.
   max_order_retries: 3
   retry_backoff_sec: 2.0
+  # Abort a Kalshi order when a fresh pre-submit quote has moved more than
+  # this from the scanned signal price. Trade 16 (2026-07-07) scanned Dallas
+  # low at $0.69, the book collapsed to $0.02 before the crossing bid landed,
+  # and the order filled 6 contracts of a dead market. Voided as stale_quote.
+  max_price_drift: 0.10
 
 polling:
   # How often each strategy's scan() is invoked.
@@ -305,7 +318,16 @@ strategies:
     enabled: true
     params:
       exchange: kalshi
-      cities: [Atlanta, NYC, Chicago, Dallas, Houston, Miami]
+      # Every city Kalshi lists daily HIGH/LOW markets for (see
+      # _KALSHI_CITY_CODES in strategies/weather/kalshi_markets.py). Lazy
+      # needs no forecast station data — resolution comes from Kalshi's own
+      # settlement — so unlike weather_kalshi the list isn't limited to the
+      # kalshi_resolution registry. The spread/volume guards below still
+      # gate out any city whose book is too thin to trust.
+      cities: [Atlanta, NYC, Chicago, Dallas, Houston, Miami,
+               Austin, Boston, Denver, Las Vegas, Los Angeles, Minneapolis,
+               New Orleans, Oklahoma City, Philadelphia, Phoenix,
+               San Antonio, San Francisco, Seattle, St. Louis]
       thresholds: [0.65, 0.75]
       claimed_edge_pct: 0.10
       max_price: 0.85

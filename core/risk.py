@@ -60,6 +60,11 @@ class RiskConfig:
     # they fire near-simultaneously, so multi-strategy comparisons stay
     # fair. Global cap above remains the hard ceiling for bug containment.
     max_concurrent_positions_per_strategy: int = 0
+    # Reject (don't bump up) any trade whose computed size lands below this.
+    # Kelly sizes off available cash, so as position slots fill the remaining
+    # cash produces dust orders (a $0.68 one-contract entry on 2026-07-06)
+    # that burn daily/concurrent slots for negligible payoff. 0 = disabled.
+    min_position_usd: float = 0.0
     # When true, reject any new trade that matches an already-open position
     # on (strategy, market_id, direction). Prevents accidental re-entry
     # when a strategy's scan re-fires on the same market before resolution,
@@ -79,6 +84,7 @@ class RiskConfig:
         return cls(
             kelly_fraction=float(d["kelly_fraction"]),
             max_position_usd=float(d["max_position_usd"]),
+            min_position_usd=float(d.get("min_position_usd", 0.0)),
             max_daily_positions=int(d["max_daily_positions"]),
             max_concurrent_positions=int(d["max_concurrent_positions"]),
             max_daily_loss_usd=float(d["max_daily_loss_usd"]),
@@ -373,6 +379,17 @@ class RiskManager:
 
             if size <= 0.0:
                 return TradeDecision(False, 0.0, "computed size <= 0", volume_tier=tier_name)
+
+            # Dust floor: a size this small means Kelly is starved (available
+            # cash is nearly all committed). Skip — never bump up to the floor,
+            # which would override Kelly exactly when the account is thinnest.
+            if 0.0 < size < self.config.min_position_usd:
+                return TradeDecision(
+                    False, 0.0,
+                    f"size ${size:.2f} below min_position_usd "
+                    f"${self.config.min_position_usd:.2f}",
+                    volume_tier=tier_name,
+                )
 
             # Per-category exposure check (only meaningful if a category is provided).
             if category:

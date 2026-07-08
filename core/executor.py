@@ -26,7 +26,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from core.client import ClobClient
-from core.kalshi_client import KalshiInsufficientFundsError, parse_kalshi_number
+from core.kalshi_client import (
+    KalshiDuplicateOrder,
+    KalshiInsufficientFundsError,
+    KalshiOrderNotFilled,
+    KalshiTransientError,
+    parse_kalshi_number,
+)
 # Side-effect import: registers the TRADE log level + .trade() helper.
 from core.logging_config import TRADE_LEVEL  # noqa: F401
 from core.logger import TradeJournal, TradeRecord
@@ -35,6 +41,20 @@ from strategies.base import TradeIntent
 
 
 log = logging.getLogger(__name__)
+
+
+class StaleQuoteError(Exception):
+    """The market re-quoted just before order submission no longer matches the
+    signal price.
+
+    The lazy strategy's thesis is price-IS-signal, so a book that moved
+    materially between scan and submit invalidates the trade outright — most
+    dramatically when a market crashes at resolution-relevant moments (trade 16:
+    scanned at $0.69, the book collapsed to $0.02 eleven seconds before the
+    crossing bid landed, and the IOC happily filled 6 contracts of a dead
+    market). No order has been placed when this is raised.
+    """
+    pass
 
 
 @dataclass
@@ -47,6 +67,11 @@ class ExecutionConfig:
     limit_offset_pct: float
     max_order_retries: int
     retry_backoff_sec: float
+    # Maximum tolerated move between the scanned signal price and a fresh
+    # quote taken immediately before submitting a Kalshi order. A larger move
+    # means the signal is stale (e.g. the book crashed at dawn on a low-temp
+    # market) — abort instead of crossing into a repriced market.
+    max_price_drift: float = 0.10
     # Per-strategy live allowlist. When non-empty, ONLY these strategy
     # instance names may submit live orders — every other strategy stays in
     # paper even on a live exchange. Empty = legacy behavior (exchange mode
@@ -70,6 +95,7 @@ class ExecutionConfig:
             limit_offset_pct=float(d["limit_offset_pct"]),
             max_order_retries=int(d["max_order_retries"]),
             retry_backoff_sec=float(d["retry_backoff_sec"]),
+            max_price_drift=float(d.get("max_price_drift", 0.10)),
             live_strategies=tuple(
                 str(s) for s in (d.get("live_strategies") or [])
             ),
@@ -352,6 +378,38 @@ class Executor:
                 trade_id=trade_id,
                 reason="insufficient_funds",
             )
+        except StaleQuoteError as e:
+            # The market repriced between scan and submit — the price-is-signal
+            # thesis no longer holds. No order was placed; void the entry so it
+            # doesn't consume a position slot or settle as a fake result.
+            self.journal.void_entry(trade_id, reason="stale_quote")
+            log.info(
+                "TRADE_STALE_QUOTE | market=%s | exchange=kalshi | bucket=%s | %s | voided trade_id=%d",
+                sig.market_id, bucket, e, trade_id,
+            )
+            return ExecutionResult(accepted=False, trade_id=trade_id, reason="stale_quote")
+        except KalshiOrderNotFilled:
+            # FOK couldn't fill against resting volume — an EXPECTED outcome on a
+            # thin book, not an error. Nothing was placed, so void the entry (no
+            # alert, no phantom). Info-level: this will be common on illiquid
+            # city markets.
+            self.journal.void_entry(trade_id, reason="unfilled")
+            log.info(
+                "TRADE_UNFILLED | market=%s | exchange=kalshi | bucket=%s | price=$%.4f | fok_no_volume trade_id=%d",
+                sig.market_id, bucket, sig.price, trade_id,
+            )
+            return ExecutionResult(accepted=False, trade_id=trade_id, reason="unfilled")
+        except KalshiDuplicateOrder:
+            # An idempotent retry hit an order that already landed — the original
+            # stands. Keep the journal entry (voiding would drop a real position;
+            # the reviewer settles it) and warn rather than alert.
+            log.warning(
+                "TRADE_DUPLICATE | market=%s | exchange=kalshi | bucket=%s | order already exists, keeping entry trade_id=%d",
+                sig.market_id, bucket, trade_id,
+            )
+            return ExecutionResult(
+                accepted=True, trade_id=trade_id, filled_usd=size_usd, reason="duplicate",
+            )
         except Exception as e:
             # The order attempt failed — nothing was placed on the exchange, so
             # the journal row written above is bogus. Void it; otherwise it
@@ -428,13 +486,15 @@ class Executor:
         intent: TradeIntent,
         size_usd: float,
     ) -> list[Any]:
-        """Place a fill-or-kill YES buy on Kalshi (V2 order endpoint).
+        """Place an immediate-or-cancel YES buy on Kalshi (V2 order endpoint).
 
-        Kalshi's V2 book is expressed on the YES leg: a buy is a ``bid``. To
-        make the fill-or-kill actually fill we price it slightly ABOVE the
-        signal price (cross the spread) rather than inside the book — a resting
-        buy below the ask never fills, which is what produced phantom journal
-        positions under the old code.
+        Kalshi's V2 book is expressed on the YES leg: a buy is a ``bid``. We
+        price it slightly ABOVE the signal (cross the spread) so it's marketable
+        — a resting buy below the ask never fills. IOC takes whatever volume is
+        resting now and cancels the rest, so thin city books fill partially
+        rather than being skipped wholesale (as fill-or-kill did). submit()
+        reconciles the journal to the actual ``fill_count``; a zero-fill (empty
+        book) comes back as fill_count=0 and is voided as unfilled.
         """
         sig = intent.signal
         ticker = sig.token_id
@@ -451,6 +511,20 @@ class Executor:
         if not client.is_authenticated:
             raise RuntimeError("Kalshi client not authenticated; cannot place live orders")
 
+        # Re-quote immediately before ordering. The scan that produced this
+        # signal can be up to scan_interval + queue latency old; a crossing
+        # IOC/FOK bid fills at whatever is resting NOW, not at the scanned
+        # price. get_midpoint() falls back to 0.5 on an empty book, which the
+        # drift check also (correctly) rejects.
+        fresh = await client.get_midpoint(ticker)
+        fresh_mid = float(fresh.get("mid", 0.5))
+        drift = abs(fresh_mid - sig.price)
+        if drift > self.config.max_price_drift:
+            raise StaleQuoteError(
+                f"{ticker}: signal price ${sig.price:.2f} but current mid "
+                f"${fresh_mid:.2f} (drift {drift:.2f} > {self.config.max_price_drift:.2f})"
+            )
+
         # Cross the spread so the FOK fills: pay up to slightly ABOVE the signal,
         # then round UP to the next whole cent (Kalshi binary markets tick in
         # cents; the client rejects sub-cent prices). Ceiling — not nearest —
@@ -462,8 +536,8 @@ class Executor:
         # Contracts affordable at the limit price (each costs `limit_price` USD).
         count = max(1, int(size_usd / limit_price))
 
-        # Stable per-order id so a retry after a transient failure is idempotent
-        # (Kalshi dedupes on client_order_id) rather than double-filling.
+        # Stable per-order id so a transient retry is idempotent (Kalshi dedupes
+        # on client_order_id) rather than double-filling.
         client_order_id = uuid.uuid4().hex
 
         attempt = 0
@@ -474,7 +548,7 @@ class Executor:
                     side="bid",
                     count=count,
                     price=limit_price,
-                    time_in_force="fill_or_kill",
+                    time_in_force="immediate_or_cancel",
                     client_order_id=client_order_id,
                 )
                 log.info(
@@ -482,15 +556,16 @@ class Executor:
                     ticker, limit_price, count, client_order_id,
                 )
                 return [resp]
-            except KalshiInsufficientFundsError:
-                # Won't recover by retrying — bubble up immediately so submit()
-                # can void the entry and pause trading.
-                raise
-            except Exception:
+            except KalshiTransientError:
+                # Network / 5xx blip — safe to retry with the same coid.
                 attempt += 1
                 if attempt >= self.config.max_order_retries:
                     raise
                 await asyncio.sleep(self.config.retry_backoff_sec * attempt)
+            # Everything else — insufficient funds, FOK no-fill, duplicate,
+            # malformed/rejected order — is NOT retryable. Retrying a permanent
+            # 4xx just re-submits the same client_order_id and trips
+            # `order_already_exists`. Propagate to submit() to handle per-type.
 
     async def _place_live_orders(
         self,

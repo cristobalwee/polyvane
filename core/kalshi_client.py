@@ -66,6 +66,18 @@ def parse_kalshi_number(value: Any) -> float | None:
         return None
 
 
+def extract_kalshi_error_code(text: str) -> str:
+    """Pull Kalshi's ``error.code`` from a JSON error body; '' if absent."""
+    try:
+        body = json.loads(text)
+        err = body.get("error") if isinstance(body, dict) else None
+        if isinstance(err, dict):
+            return str(err.get("code") or "")
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return ""
+
+
 class KalshiTransientError(Exception):
     pass
 
@@ -78,6 +90,38 @@ class KalshiInsufficientFundsError(Exception):
     the API with orders that can't fill.
     """
     pass
+
+
+class KalshiOrderNotFilled(Exception):
+    """A fill-or-kill / immediate-or-cancel order didn't fill.
+
+    Kalshi returns 409 ``fill_or_kill_insufficient_resting_volume`` when a FOK
+    can't be fully matched against resting volume. This is an EXPECTED outcome
+    of choosing FOK on a thin book — no position was opened — not an integration
+    error. Typed separately so the executor voids the (unfilled) entry and does
+    NOT alert or retry.
+    """
+    pass
+
+
+class KalshiDuplicateOrder(Exception):
+    """Kalshi already has an order with this client_order_id (409
+    ``order_already_exists``).
+
+    Arises only from an idempotent retry of a request that already landed —
+    Kalshi's dedup working as intended. The original order stands, so the
+    executor keeps its journal entry rather than voiding or resubmitting, and
+    does not alert.
+    """
+    pass
+
+
+# Kalshi error codes that are normal operating conditions, not integration
+# breaks — they must not fire the "API rejected" operator alert.
+_BENIGN_ORDER_CODES = {
+    "fill_or_kill_insufficient_resting_volume": KalshiOrderNotFilled,
+    "order_already_exists": KalshiDuplicateOrder,
+}
 
 
 @dataclass
@@ -125,14 +169,7 @@ class KalshiClient:
         hook = self._alert_hook
         if hook is None:
             return
-        code = ""
-        try:
-            body = json.loads(text)
-            err = body.get("error") if isinstance(body, dict) else None
-            if isinstance(err, dict):
-                code = str(err.get("code") or "")
-        except (ValueError, TypeError, AttributeError):
-            pass
+        code = extract_kalshi_error_code(text)
         try:
             hook("api_error", {
                 "source": "kalshi",
@@ -279,9 +316,16 @@ class KalshiClient:
                         raise KalshiInsufficientFundsError(
                             f"Kalshi rejected order — insufficient balance: {text[:300]}"
                         )
+                    # Benign operating conditions (FOK no-fill, idempotent
+                    # duplicate) are normal — raise them typed WITHOUT alerting
+                    # so they don't page the operator as an integration break.
+                    code = extract_kalshi_error_code(text)
+                    benign = _BENIGN_ORDER_CODES.get(code)
+                    if benign is not None:
+                        raise benign(f"Kalshi {code}: {text[:200]}")
                     # Any other non-transient rejection (400/401/403/404/410/…)
-                    # means the request was well-formed enough to reach Kalshi
-                    # but got refused — the signature of an API contract change.
+                    # means the request reached Kalshi but was refused — the
+                    # signature of an API contract change or malformed request.
                     # Alert the operator before raising so it's loud, not silent.
                     self._emit_api_error(method, path, resp.status, text)
                     raise RuntimeError(f"Kalshi API error {resp.status}: {text[:500]}")

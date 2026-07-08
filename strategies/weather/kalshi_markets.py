@@ -5,15 +5,19 @@ Fetches active Kalshi temperature binary markets and normalizes them into
 Polymarket `WeatherMarket` objects produced by `markets.py` / `GammaClient`.
 
 Kalshi temperature tickers follow the pattern:
-    KXHIGH<CITY_CODE>-<YYMONDD>-T<THRESHOLD>
-    KXLOW<CITY_CODE>-<YYMONDD>-T<THRESHOLD>
+    KXHIGH<CITY_CODE>-<YYMONDD>-T<THRESHOLD>     (threshold market, ">X°" / "<X°")
+    KXLOW<CITY_CODE>-<YYMONDD>-B<MIDPOINT>       (bucket market, "X° to Y°")
 
 Examples:
-    KXHIGHATL-25MAY14-T68   (Atlanta HIGH ≥ 68°F on 2025-05-14)
-    KXLOWNYC-25MAY14-T55    (NYC LOW ≥ 55°F on 2025-05-14)
+    KXHIGHATL-25MAY14-T68     (Atlanta HIGH vs 68°F threshold)
+    KXHIGHMIA-26JUL08-B93.5   (Miami HIGH in the 93-94°F bucket)
 
-Each market is binary: resolves YES if the observed extreme meets/exceeds
-the threshold; NO otherwise. All Kalshi US temperature markets report in °F.
+Threshold markets resolve YES per the comparison in the QUESTION (">96°",
+"<89°"); bucket markets (B suffix, half-degree midpoint) resolve YES when the
+observed extreme lands inside the integer range spelled out in the question
+("93-94°"). Each event's most-likely buckets carry most of the volume, so
+skipping B tickers hides roughly two-thirds of Kalshi's temperature markets.
+All Kalshi US temperature markets report in °F.
 """
 from __future__ import annotations
 
@@ -30,9 +34,10 @@ if TYPE_CHECKING:
 log = logging.getLogger("strategy.weather.kalshi_markets")
 
 
-# Regex for Kalshi weather tickers.
+# Regex for Kalshi weather tickers. Accepts both threshold (T68) and bucket
+# (B93.5) suffixes; the value may be fractional (bucket midpoints end in .5).
 _TICKER_RE = re.compile(
-    r"^KX(HIGH|LOW)([A-Z]{2,5})-(\d{2})([A-Z]{3})(\d{2})-T(\d+)$",
+    r"^KX(HIGH|LOW)([A-Z]{2,5})-(\d{2})([A-Z]{3})(\d{2})-[TB](\d+(?:\.\d+)?)$",
     re.IGNORECASE,
 )
 
