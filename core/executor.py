@@ -524,6 +524,16 @@ class Executor:
                 f"{ticker}: signal price ${sig.price:.2f} but current mid "
                 f"${fresh_mid:.2f} (drift {drift:.2f} > {self.config.max_price_drift:.2f})"
             )
+        # The drift band alone still admits fills BELOW the strategy's entry
+        # floor (trade 25: scanned $0.65, filled $0.62 — inside ±0.10 but
+        # outside the band the lazy thesis was validated on). When the signal
+        # carries its ladder rung, enforce it as a hard floor on the fresh mid.
+        floor = sig.metadata.get("ladder_threshold")
+        if floor is not None and fresh_mid < float(floor):
+            raise StaleQuoteError(
+                f"{ticker}: current mid ${fresh_mid:.2f} fell below the "
+                f"${float(floor):.2f} entry floor (signal ${sig.price:.2f})"
+            )
 
         # Cross the spread so the FOK fills: pay up to slightly ABOVE the signal,
         # then round UP to the next whole cent (Kalshi binary markets tick in

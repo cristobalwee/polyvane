@@ -70,6 +70,12 @@ class RiskConfig:
     # when a strategy's scan re-fires on the same market before resolution,
     # and survives bot restarts (in-memory dedup sets don't). Set false if
     # you want a strategy to legitimately pyramid into a position.
+    # Hard ceiling on TOTAL open exposure (sum of size_usd, all strategies)
+    # in any single market. Ladder strategies legitimately stack positions on
+    # one market (dedup is off for lazy), so per-trade caps alone don't bound
+    # the pile — two $12.80 rungs landed $25.60 on one Denver market
+    # (2026-07-09) and both stopped out. 0 disables the check.
+    max_market_exposure_usd: float = 0.0
     dedup_open_positions: bool = True
     # Per-strategy override for `dedup_open_positions`. Strategies named here
     # use the override; everything else uses the global default. Used by
@@ -94,6 +100,7 @@ class RiskConfig:
             max_concurrent_positions_per_strategy=int(
                 d.get("max_concurrent_positions_per_strategy", 0)
             ),
+            max_market_exposure_usd=float(d.get("max_market_exposure_usd", 0.0) or 0.0),
             dedup_open_positions=bool(d.get("dedup_open_positions", True)),
             dedup_open_positions_per_strategy={
                 str(k): bool(v) for k, v in (d.get("dedup_open_positions_per_strategy") or {}).items()
@@ -379,6 +386,25 @@ class RiskManager:
 
             if size <= 0.0:
                 return TradeDecision(False, 0.0, "computed size <= 0", volume_tier=tier_name)
+
+            # Per-market exposure ceiling (all strategies combined). Clamp the
+            # new size into whatever headroom the market has left; the dust
+            # floor below rejects remnants not worth trading.
+            if self.config.max_market_exposure_usd > 0:
+                market_open = sum(
+                    float(p.get("size_usd") or 0.0)
+                    for p in open_positions
+                    if p.get("market_id") == market_id
+                )
+                headroom = self.config.max_market_exposure_usd - market_open
+                if headroom <= 0:
+                    return TradeDecision(
+                        False, 0.0,
+                        f"max_market_exposure_usd reached on {market_id} "
+                        f"(${market_open:.2f}/${self.config.max_market_exposure_usd:.2f})",
+                        volume_tier=tier_name,
+                    )
+                size = min(size, headroom)
 
             # Dust floor: a size this small means Kelly is starved (available
             # cash is nearly all committed). Skip — never bump up to the floor,

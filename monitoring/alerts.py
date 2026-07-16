@@ -42,6 +42,8 @@ EVENT_TYPES = (
     "new_city_detected",
     "health_warning",
     "stop_loss_triggered",
+    "stop_loss_unfilled",
+    "stop_loss_partial",
 )
 
 
@@ -570,6 +572,23 @@ def format_message(
             f"exit {payload.get('exit_price', 0.0):.3f} "
             f"(-{payload.get('loss_pct', 0.0):.0f}%) "
             f"PnL ${payload.get('pnl', 0.0):+.2f}"
+        )
+    if event_type == "stop_loss_unfilled":
+        return (
+            f"⚠️ **Stop-loss UNFILLED** [{payload.get('strategy')}] "
+            f"`{payload.get('market_id')}` — IOC found no bid "
+            f"(mark {payload.get('mark_price', 0.0):.2f}, "
+            f"{payload.get('shares', 0.0):.2f} contracts still open). "
+            "Position remains live; the stop will retry next check."
+        )
+    if event_type == "stop_loss_partial":
+        return (
+            f"🟠 **Stop-loss partial fill** [{payload.get('strategy')}] "
+            f"`{payload.get('market_id')}` — sold "
+            f"{payload.get('filled_shares', 0.0):.2f} @ "
+            f"{payload.get('exit_price', 0.0):.2f} "
+            f"(realized ${payload.get('pnl', 0.0):+.2f}); "
+            f"{payload.get('remaining_shares', 0.0):.2f} contracts remain open."
         )
     return f"[{event_type}] {payload}"
 

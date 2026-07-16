@@ -374,10 +374,16 @@ class WeatherStrategy(BaseStrategy):
                 prob = exceed
             edge = prob - m.yes_price
 
-            if abs(edge) < self._min_edge:
+            # Signed, not abs: entries are YES-only (executor + stop-loss both
+            # assume it), so a negative edge — model says the market is
+            # overpriced — is untradeable here. Emitting it as a YES signal
+            # just fed the risk module's min_edge gate a stream of silent
+            # rejections; live diagnosis 2026-07-15 showed ~14 of 15 signals
+            # were negative-edge, which is why weather_kalshi never traded.
+            if edge < self._min_edge:
                 skipped_edge += 1
                 continue
-            if abs(edge) > self._max_edge_sanity:
+            if edge > self._max_edge_sanity:
                 self.log.warning(
                     "Kalshi: skipping implausibly large edge (city=%s ticker=%s edge=%.2f cap=%.2f)",
                     m.city, m.ticker, edge, self._max_edge_sanity,

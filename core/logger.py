@@ -172,6 +172,38 @@ class TradeJournal:
                 (entry_price, shares, size_usd, trade_id),
             )
 
+    def apply_partial_exit(
+        self,
+        trade_id: int,
+        *,
+        shares: float,
+        size_usd: float,
+        realized_pnl: float,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Shrink an open position after a partial exit fill.
+
+        A stop-loss IOC on a thin book can fill only part of the position. The
+        row stays `pending` with the remaining shares/size so the stop loop
+        and the resolution reviewer keep tracking what is actually still on
+        the exchange. The realized chunk accumulates in
+        metadata['partial_exit_pnl'], which the reviewer adds to the
+        settlement PnL of the remainder — dropping it would misstate the
+        trade's total by whatever the partial exit banked.
+        """
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT metadata_json FROM trades WHERE id = ?", (trade_id,)).fetchone()
+            merged = json.loads(row["metadata_json"]) if row else {}
+            merged["partial_exit_pnl"] = round(
+                float(merged.get("partial_exit_pnl") or 0.0) + realized_pnl, 6
+            )
+            if metadata:
+                merged.update(metadata)
+            conn.execute(
+                "UPDATE trades SET shares = ?, size_usd = ?, metadata_json = ? WHERE id = ?",
+                (shares, size_usd, json.dumps(_sanitize_for_json(merged), default=str), trade_id),
+            )
+
     def void_entry(self, trade_id: int, *, reason: str) -> None:
         """Mark a recorded entry as voided — the order was never actually placed.
 
@@ -252,9 +284,16 @@ class TradeJournal:
             return float(row["total"])
 
     def count_entries_since(self, since_iso: str) -> int:
+        """Entries counted against max_daily_positions.
+
+        Voided rows are excluded: they are order attempts that never became
+        positions (unfilled IOC, stale quote, rejected order). Counting them
+        let a run of no-fill attempts eat the whole daily budget — on
+        2026-07-08 half the day's slots went to voids.
+        """
         with self._lock, self._connect() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) AS n FROM trades WHERE timestamp >= ?",
+                "SELECT COUNT(*) AS n FROM trades WHERE timestamp >= ? AND outcome != 'voided'",
                 (since_iso,),
             ).fetchone()
             return int(row["n"])

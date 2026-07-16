@@ -180,9 +180,93 @@ class Reviewer:
         closed += await self._check_polymarket_resolutions(polymarket_pending)
         closed += await self._check_kalshi_resolutions(kalshi_pending)
 
+        try:
+            await self._annotate_stop_counterfactuals()
+        except Exception:
+            log.exception("stop-loss counterfactual annotation failed")
+
         if closed:
             log.info("Reviewer: closed %d trade(s) this pass", closed)
         return closed
+
+    async def _annotate_stop_counterfactuals(self) -> int:
+        """Record what each stopped-out trade WOULD have earned if held.
+
+        Once a stopped market finalizes, annotate the trade with the market's
+        actual result and the hold-to-resolution PnL. This is what makes the
+        stop threshold tunable from data instead of vibes: the 2026-07-15
+        manual audit showed the 0.50 stop saved money (-$81 realized vs -$110
+        held) while the tightened 0.35 stop cost money (5/10 stopped markets
+        went on to resolve YES) — this pass keeps that ledger current
+        automatically. Kalshi only; runs once per trade (skips rows already
+        annotated).
+        """
+        if self._session is None:
+            return 0
+        with _connect(self.db_path) as conn:
+            lost = [dict(r) for r in conn.execute(
+                "SELECT * FROM trades WHERE outcome = 'lost' AND exchange = 'kalshi'"
+            ).fetchall()]
+
+        todo: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for t in lost:
+            try:
+                meta = json.loads(t.get("metadata_json") or "{}")
+            except json.JSONDecodeError:
+                continue
+            if meta.get("exit_reason") != "stop_loss":
+                continue
+            if "stop_counterfactual" in meta:
+                continue
+            todo.append((t, meta))
+        if not todo:
+            return 0
+
+        states: dict[str, dict[str, Any]] = {}
+        for ticker in sorted({t["market_id"] for t, _ in todo}):
+            state = await self._fetch_kalshi_market_state(ticker)
+            if state is not None:
+                states[ticker] = state
+
+        from core.logger import _sanitize_for_json
+        annotated = 0
+        for t, meta in todo:
+            state = states.get(t["market_id"])
+            if state is None:
+                continue
+            if str(state.get("status") or "").lower() != "finalized":
+                continue
+            result = str(state.get("result") or "").lower()
+            if result not in ("yes", "no"):
+                continue
+            shares = float(t.get("shares") or 0.0)
+            size = float(t.get("size_usd") or 0.0)
+            settle = 1.0 if result == "yes" else 0.0
+            hold_pnl = shares * settle - size
+            stop_pnl = float(t.get("pnl") or 0.0)
+            meta["stop_counterfactual"] = {
+                "market_result": result,
+                "hold_pnl": round(hold_pnl, 4),
+                # Positive = the stop saved money vs holding; negative = the
+                # stop cut a position that would have done better held.
+                "stop_saved_usd": round(stop_pnl - hold_pnl, 4),
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            }
+            with _connect(self.db_path) as conn:
+                conn.execute(
+                    "UPDATE trades SET metadata_json = ? WHERE id = ?",
+                    (json.dumps(_sanitize_for_json(meta), default=str), t["id"]),
+                )
+                conn.commit()
+            annotated += 1
+            log.info(
+                "Stop counterfactual trade #%d %s: market resolved %s — "
+                "stop pnl $%+.2f vs hold $%+.2f (%s $%.2f)",
+                t["id"], t["market_id"], result.upper(), stop_pnl, hold_pnl,
+                "saved" if stop_pnl >= hold_pnl else "cost",
+                abs(stop_pnl - hold_pnl),
+            )
+        return annotated
 
     async def _check_polymarket_resolutions(self, pending: list[dict[str, Any]]) -> int:
         if not pending:
@@ -351,7 +435,16 @@ class Reviewer:
             settle = 1.0 if settled_price_for_yes >= 0.5 else 0.0
         else:
             settle = 0.0 if settled_price_for_yes >= 0.5 else 1.0
-        return shares * settle - size
+        pnl = shares * settle - size
+        # A partial stop-loss exit shrinks the row to the remainder and banks
+        # the realized chunk in metadata (TradeJournal.apply_partial_exit);
+        # fold it back in so the trade's total PnL is complete.
+        try:
+            meta = json.loads(trade.get("metadata_json") or "{}")
+            pnl += float(meta.get("partial_exit_pnl") or 0.0)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        return pnl
 
     def _record_resolution(
         self,
@@ -500,6 +593,34 @@ class Reviewer:
                         f"{kind}={key}: predicted-vs-realized gap {bias:+.1%} "
                         f"({direction}) over {m['n_closed']} closed trade(s)"
                     )
+
+        # Stop-loss counterfactual bucket: across annotated stop-outs in the
+        # window, how much did stopping save (or cost) vs holding, and how
+        # often did the stopped market go on to resolve YES? A persistently
+        # negative save with a high cut-winner rate says the threshold is
+        # inside normal churn and should loosen.
+        cf_rows = [
+            (r, _meta(r)["stop_counterfactual"]) for r in closed
+            if isinstance(_meta(r).get("stop_counterfactual"), dict)
+        ]
+        if cf_rows:
+            n_cf = len(cf_rows)
+            saved = sum(float(cf.get("stop_saved_usd") or 0.0) for _, cf in cf_rows)
+            cut_winners = sum(1 for _, cf in cf_rows if cf.get("market_result") == "yes")
+            bucket_metrics.append(("stop_loss", "counterfactual", {
+                "n_closed": n_cf,
+                "win_rate": cut_winners / n_cf,   # rate of stops that cut an eventual winner
+                "avg_edge_in": None,
+                "avg_realized": None,
+                "bias_pct": None,
+                "total_pnl": saved,               # net $ saved by stopping vs holding
+            }))
+            if saved < 0:
+                flags.append(
+                    f"stop_loss counterfactual: stopping COST ${-saved:.2f} vs holding "
+                    f"over {n_cf} stop(s); {cut_winners} cut eventual winners — "
+                    "threshold may be too tight"
+                )
 
         if persist:
             self._persist_metrics(period=period, bucket_metrics=bucket_metrics)

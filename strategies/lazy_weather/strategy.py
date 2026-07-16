@@ -202,10 +202,14 @@ class LazyWeatherStrategy(BaseStrategy):
             if not crossed:
                 skipped_already_fired += 1
                 continue
-            for t in crossed:
-                fired.add(t)
-                candidates += 1
-                signals.append(self._make_signal(m, t))
+            # Fire ONE rung per scan — the highest crossed — and retire the
+            # rest. The ladder is a price-conviction pyramid: each add should
+            # follow an observed climb between scans. Firing every crossed
+            # rung at once doubled exposure whenever a market first appeared
+            # above two rungs (2×$12.80 on KXLOWTDEN-26JUL09, -$24.64).
+            fired.update(crossed)
+            candidates += 1
+            signals.append(self._make_signal(m, max(crossed)))
 
         # Garbage-collect _fired entries whose markets are no longer in the
         # active result set (resolved or dropped from Gamma).
@@ -269,10 +273,12 @@ class LazyWeatherStrategy(BaseStrategy):
             if not crossed:
                 skipped_already_fired += 1
                 continue
-            for t in crossed:
-                fired.add(t)
-                candidates += 1
-                signals.append(self._make_kalshi_signal(m, t))
+            # One rung per scan (highest crossed); lower rungs are retired,
+            # not queued. See the Polymarket loop above — a market first seen
+            # above both rungs must open ONE position, not one per rung.
+            fired.update(crossed)
+            candidates += 1
+            signals.append(self._make_kalshi_signal(m, max(crossed)))
 
         # Garbage-collect expired Kalshi markets from _fired.
         live_keys = {(m.ticker, "") for m in markets}

@@ -21,8 +21,10 @@ import json
 import logging
 import math
 import uuid
+from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
+from core.kalshi_client import parse_kalshi_number
 from core.logger import TradeJournal
 
 if TYPE_CHECKING:
@@ -91,6 +93,20 @@ class StopLossManager:
             token_id = meta.get("token_id") or ""
             if not token_id:
                 continue
+            # Skip positions whose market has already closed: there is no book
+            # to exit into, and a sell order 404s (market_not_found). Trade 16's
+            # zombie position fired one every 60s all night (2026-07-08),
+            # paging the operator every alert-cooldown window until Kalshi
+            # finalized the market. Post-close settlement is the resolution
+            # reviewer's job, not the stop-loss's.
+            end_iso = meta.get("end_utc")
+            if end_iso:
+                try:
+                    end_dt = datetime.fromisoformat(end_iso)
+                    if end_dt <= datetime.now(timezone.utc):
+                        continue
+                except (ValueError, TypeError):
+                    pass
             # Exchange: prefer the dedicated column, fall back to metadata.
             exchange = pos.get("exchange") or meta.get("exchange") or "polymarket"
             candidates.append((pos, token_id, exchange))
@@ -137,6 +153,20 @@ class StopLossManager:
             if not client.is_initialized:
                 return tid, None
             try:
+                if exchange == "kalshi":
+                    # Mark at the best YES bid — the price a stop-out can
+                    # actually sell into. The midpoint of a one-sided book is
+                    # fiction: when the ask side vanishes the mid craters
+                    # through the trigger and the journal booked exits at
+                    # $0.01–0.03 that no order could have achieved (trades
+                    # 59/60/305). No bid at all means there is nothing to
+                    # exit into — skip; the IOC would just cancel unfilled.
+                    book = await asyncio.wait_for(
+                        client.get_orderbook(tid, depth=1), timeout=5.0
+                    )
+                    ob = book.get("orderbook_fp") or book.get("orderbook") or book
+                    yes_levels = ob.get("yes_dollars") or ob.get("yes") or []
+                    return tid, client._best_book_price(yes_levels)
                 resp = await asyncio.wait_for(client.get_midpoint(tid), timeout=5.0)
                 mid = resp.get("mid") if isinstance(resp, dict) else resp
                 return tid, float(mid) if mid is not None else None
@@ -163,29 +193,99 @@ class StopLossManager:
         trade_id = int(pos["id"])
         shares = float(pos.get("shares") or 0.0)
         size_usd = float(pos.get("size_usd") or 0.0)
-        pnl = (current_price - entry_price) * shares
         loss_pct = (1.0 - current_price / entry_price) * 100
 
         log.warning(
             "STOP_LOSS | trade_id=%d strategy=%s market=%s exchange=%s "
-            "entry=%.4f current=%.4f loss=%.1f%% pnl=$%.2f",
+            "entry=%.4f current=%.4f loss=%.1f%%",
             trade_id, pos.get("strategy"), pos.get("market_id"), exchange,
-            entry_price, current_price, loss_pct, pnl,
+            entry_price, current_price, loss_pct,
         )
+
+        # Paper mode books the exit at the observed mark. Live mode books it
+        # at what the exchange actually reports back — never at the mark.
+        exit_price = current_price
+        exited_shares = shares
 
         if not self._is_paper_for(exchange):
             if exchange == "kalshi":
-                await self._place_kalshi_sell(pos, token_id, current_price, shares)
+                fill_count, avg_fill = await self._place_kalshi_sell(
+                    pos, token_id, current_price, shares
+                )
+                if fill_count is None:
+                    # Dust position (< 0.01 sellable) — left for the reviewer.
+                    return
+                if fill_count <= 0:
+                    # IOC came back canceled with zero fills: the bid we
+                    # marked against was gone by the time the order landed.
+                    # The position is still LIVE on Kalshi, so the journal
+                    # row must stay open — recording an exit here is how
+                    # closed-in-journal/open-on-exchange zombies were born.
+                    # The next check retries; alert so the operator knows.
+                    log.warning(
+                        "STOP_LOSS_UNFILLED | trade_id=%d market=%s — IOC canceled "
+                        "with no fills, position remains open; will retry",
+                        trade_id, pos.get("market_id"),
+                    )
+                    self._emit("stop_loss_unfilled", {
+                        "trade_id": trade_id,
+                        "strategy": pos.get("strategy"),
+                        "market_id": pos.get("market_id"),
+                        "entry_price": entry_price,
+                        "mark_price": current_price,
+                        "shares": shares,
+                        "exchange": exchange,
+                    })
+                    return
+                exit_price = avg_fill if avg_fill is not None else current_price
+                if fill_count < shares - 0.005:
+                    # Partial fill: shrink the journal row to the remainder
+                    # and bank the realized chunk in metadata. The row stays
+                    # open so the next check (or the reviewer at settlement)
+                    # handles what's still on the exchange.
+                    realized = (exit_price - entry_price) * fill_count
+                    remaining = round(shares - fill_count, 2)
+                    self._journal.apply_partial_exit(
+                        trade_id,
+                        shares=remaining,
+                        size_usd=round(entry_price * remaining, 6),
+                        realized_pnl=realized,
+                        metadata={
+                            "last_partial_exit_price": exit_price,
+                            "last_partial_exit_shares": fill_count,
+                        },
+                    )
+                    log.warning(
+                        "STOP_LOSS_PARTIAL | trade_id=%d market=%s filled %.2f/%.2f "
+                        "@ $%.2f (realized $%.2f), %.2f contracts remain open",
+                        trade_id, pos.get("market_id"), fill_count, shares,
+                        exit_price, realized, remaining,
+                    )
+                    self._emit("stop_loss_partial", {
+                        "trade_id": trade_id,
+                        "strategy": pos.get("strategy"),
+                        "market_id": pos.get("market_id"),
+                        "entry_price": entry_price,
+                        "exit_price": exit_price,
+                        "filled_shares": fill_count,
+                        "remaining_shares": remaining,
+                        "pnl": realized,
+                        "exchange": exchange,
+                    })
+                    return
+                exited_shares = fill_count
             else:
                 await self._place_sell_order(pos, token_id, current_price, shares)
 
+        pnl = (exit_price - entry_price) * exited_shares
         self._journal.record_exit(
             trade_id=trade_id,
             outcome="lost",
             pnl=pnl,
             metadata={
                 "exit_reason": "stop_loss",
-                "exit_price": current_price,
+                "exit_price": exit_price,
+                "exit_mark": current_price,
                 "stop_loss_pct": self._stop_loss_pct,
                 "exchange": exchange,
             },
@@ -197,7 +297,7 @@ class StopLossManager:
             "market_id": pos.get("market_id"),
             "market_question": pos.get("market_question"),
             "entry_price": entry_price,
-            "exit_price": current_price,
+            "exit_price": exit_price,
             "loss_pct": loss_pct,
             "pnl": pnl,
             "size_usd": size_usd,
@@ -243,13 +343,18 @@ class StopLossManager:
         ticker: str,
         current_price: float,
         shares: float,
-    ) -> None:
+    ) -> tuple[float | None, float | None]:
         """Place a Kalshi exit order to close a YES position (V2 endpoint).
 
         Closing a YES long = selling YES = a ``side="ask"`` order. We price it
         slightly BELOW the current mark and use immediate-or-cancel so we take
         whatever exit liquidity exists right now rather than resting (a stop-out
-        should get out, even partially, not sit unfilled)."""
+        should get out, even partially, not sit unfilled).
+
+        Returns ``(fill_count, average_fill_price)`` parsed from the V2
+        response. ``(0.0, None)`` means the IOC canceled with no fills — the
+        position is still open on the exchange. ``(None, None)`` means no
+        order was placed (dust position left for the reviewer)."""
         client = self._client_for("kalshi")
         if not client.is_authenticated:
             raise RuntimeError("Kalshi client not authenticated; cannot place stop-loss order")
@@ -263,9 +368,18 @@ class StopLossManager:
         # tick in cents; sub-cent prices are rejected). Floor keeps the exit
         # marketable after the snap.
         limit_price = min(0.99, max(0.01, math.floor(current_price * 0.99 * 100) / 100.0))
-        count = max(1, int(shares))
+        # Sell EXACTLY what we hold — Kalshi contracts are fractional under the
+        # fp schema. Rounding up oversells (a 0.3-contract position is not 1
+        # contract); truncating strands the remainder untracked.
+        count = round(shares, 2)
+        if count < 0.01:
+            log.warning(
+                "stop_loss: trade_id=%s holds %.4f contracts (< 0.01 sellable) — leaving for the reviewer",
+                pos.get("id"), shares,
+            )
+            return None, None
 
-        await client.create_order(
+        resp = await client.create_order(
             ticker=ticker,
             side="ask",
             count=count,
@@ -273,3 +387,9 @@ class StopLossManager:
             time_in_force="immediate_or_cancel",
             client_order_id=uuid.uuid4().hex,
         )
+        # V2 reports fill_count / average_fill_price on the 201 — an IOC that
+        # found no bid comes back canceled with fill_count=0, NOT an error.
+        resp0 = resp if isinstance(resp, dict) else {}
+        fill_count = parse_kalshi_number(resp0.get("fill_count")) or 0.0
+        avg_fill = parse_kalshi_number(resp0.get("average_fill_price"))
+        return fill_count, avg_fill

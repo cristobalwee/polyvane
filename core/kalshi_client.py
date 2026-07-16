@@ -468,7 +468,7 @@ class KalshiClient:
         self,
         ticker: str,
         side: str,
-        count: int,
+        count: float,
         price: float,
         *,
         time_in_force: str = "fill_or_kill",
@@ -504,10 +504,19 @@ class KalshiClient:
         price_cents = round(price * 100)
         if not (1 <= price_cents <= 99):
             raise ValueError(f"Kalshi order price must be in 1..99¢, got {price!r}")
+        # The fp schema supports FRACTIONAL contracts — resting lots like
+        # "17.57" appear in live books, and IOC entries fill fractionally
+        # against them. Truncating to int here silently resized orders: a
+        # stop-loss closing an 11.51-contract position sold 11, stranding
+        # 0.51 contracts the journal no longer tracked. Two decimals matches
+        # the book's lot precision.
+        count = round(float(count), 2)
+        if count < 0.01:
+            raise ValueError(f"Kalshi order count must be >= 0.01, got {count!r}")
         body: dict[str, Any] = {
             "ticker": ticker,
             "side": side,
-            "count": str(int(count)),
+            "count": f"{count:.2f}",
             "price": f"{price_cents / 100:.2f}",
             "time_in_force": time_in_force,
             "self_trade_prevention_type": self_trade_prevention_type,

@@ -9,7 +9,7 @@ risk:
   # Raised $10 → $15 (2026-07-07) alongside funding the account past the
   # initial $50 — the low volume tier below must move in lockstep, since
   # every Kalshi weather market is < $50k volume and lands in that tier.
-  max_position_usd: 15.0
+  max_position_usd: 10.0
   # Skip any trade whose Kelly-computed size lands below this. Kelly sizes
   # off available CASH, so once a few slots are open the leftover produces
   # dust orders ($0.68 entries) that burn daily/concurrent slots for
@@ -21,7 +21,7 @@ risk:
   # journal. Tightened to 5 for the live $50 Kalshi run: at the $10 per-position
   # cap, ~5 positions is the entire bankroll, and Kalshi weather markets resolve
   # end-of-day so funds don't free up intraday. Scale up once validated.
-  max_daily_positions: 10
+  max_daily_positions: 15
   # Maximum simultaneously open positions GLOBALLY. At $10/position this is the
   # bankroll ceiling for the $50 account — opening a 6th would need funds that
   # aren't there. Bug-containment + balance ceiling in one.
@@ -45,6 +45,11 @@ risk:
   min_edge_pct: 0.10
   # Stop-loss threshold. Exit any open position whose current midpoint has
   # fallen to <= (1 - stop_loss_pct) × entry_price. 0.50 = exit at -50%.
+  # Reverted 0.35 → 0.50 (2026-07-15): counterfactual vs Kalshi settlements
+  # over Jul 8–16 showed the 0.50 stop saved money (-$81 realized vs -$110
+  # held; 14/17 stopped markets resolved NO) while 0.35 cost money (-$25 vs
+  # -$21 held; 5/10 stopped markets went on to resolve YES). A 35% trigger
+  # sits inside the normal intraday churn of daily weather markets.
   stop_loss_pct: 0.50
   # Volume-aware position caps. The first tier whose [min, max) range
   # contains the market's volumeUsd determines the per-trade ceiling.
@@ -57,7 +62,7 @@ risk:
       # Kept equal to the global max_position_usd: ALL Kalshi weather
       # markets fall in this tier, so a lower value here silently re-caps
       # every live trade regardless of the global setting.
-      max_position_usd: 15.0
+      max_position_usd: 10.0
     - name: mid
       min_volume_usd: 50000
       max_volume_usd: 200000
@@ -66,6 +71,13 @@ risk:
       min_volume_usd: 200000
       max_volume_usd: inf
       max_position_usd: 25.0
+  # Hard ceiling on TOTAL open exposure in any single market, summed across
+  # all strategies and ladder rungs. Added 2026-07-15 after both lazy rungs
+  # fired on one scan and stacked 2×$12.80 on a single Denver market (both
+  # stopped out, -$24.64 — the worst single event in the live journal).
+  # 1.5× the per-position cap: room for one full position plus a smaller
+  # pyramid add, never a doubled book on one market. 0 disables.
+  max_market_exposure_usd: 15.0
   # Reject a new trade when the strategy already holds an open position on
   # the same market_id. Default true. Strategies in the override map below
   # use their own value — `lazy` opts out so its price-ladder rungs aren't
@@ -328,7 +340,13 @@ strategies:
                Austin, Boston, Denver, Las Vegas, Los Angeles, Minneapolis,
                New Orleans, Oklahoma City, Philadelphia, Phoenix,
                San Antonio, San Francisco, Seattle, St. Louis]
-      thresholds: [0.65, 0.75]
+      # Entry floor raised 0.65 → 0.75 (2026-07-15). Calibration over the
+      # first 12 live days: 0.65-rung entries resolved YES only ~61-67%
+      # while costing 66-70¢ (-$16.11 over 49 trades) — negative edge even
+      # before fees. The 0.75 rung ran ~78% YES, roughly breakeven. Until
+      # forecast confirmation (hybrid) gates entries, only trade the band
+      # that isn't provably bleeding.
+      thresholds: [0.75]
       claimed_edge_pct: 0.10
       max_price: 0.85
       # Lowered from 12 → 2 for Kalshi: daily weather thresholds only climb
